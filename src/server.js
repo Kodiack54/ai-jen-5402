@@ -1,20 +1,25 @@
+require("dotenv").config({ path: __dirname + "/../.env" });
 /**
  * Jen 5407 - The Scrubber
  * Processes raw captured data from Chad, cleans/extracts/validates, sends to Susan
  */
 
 const express = require('express');
+const cors = require('cors');
 const { Logger } = require('./lib/logger');
 const config = require('./lib/config');
 const processor = require('./services/processor');
 const healthRoutes = require('./routes/health');
+const bucketsRoutes = require('./routes/buckets');
 
 const logger = new Logger('Jen');
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 // Routes
 app.use('/', healthRoutes);
+app.use('/', bucketsRoutes);
 
 // Processing intervals
 const QUICK_PROCESS_INTERVAL = 10 * 1000;      // 30 seconds - pattern matching
