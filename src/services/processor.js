@@ -1,6 +1,7 @@
 /**
  * Jen Processor Service
  * The brain of Jen - all pattern recognition, AI extraction, and validation
+ * Supports BOTH legacy format AND new 20-bucket format
  */
 
 const { Logger } = require('../lib/logger');
@@ -8,6 +9,7 @@ const db = require('../lib/db');
 const config = require('../lib/config');
 const patternExtractor = require('./patternExtractor');
 const smartExtractor = require('./smartExtractor');
+const smartPatterns = require('./smartPatterns');
 const validator = require('./validator');
 const susanClient = require('./susanClient');
 
@@ -30,7 +32,6 @@ async function quickProcess(batchSize = 50) {
   let errors = 0;
 
   try {
-    // Get unprocessed messages from staging
     const { data: messages, error } = await db.from('dev_ai_staging')
       .select('*')
       .eq('processed', false)
@@ -42,20 +43,16 @@ async function quickProcess(batchSize = 50) {
       return { processed: 0, errors: 0 };
     }
 
-    // Group messages by session
     const sessionGroups = groupBySession(messages);
 
     for (const [sessionId, sessionMessages] of Object.entries(sessionGroups)) {
       try {
-        // Run pattern extraction
         const patterns = patternExtractor.extract(sessionMessages);
 
         if (patterns.hasData) {
-          // Send quick patterns to Susan
           await susanClient.sendQuickPatterns(sessionId, sessionMessages[0].project_path, patterns);
         }
 
-        // Mark as processed (quick parse done)
         const ids = sessionMessages.map(m => m.id);
         await markProcessed(ids, 'quick');
         processed += sessionMessages.length;
@@ -83,11 +80,10 @@ async function smartProcess(batchSize = 50) {
   let errors = 0;
 
   try {
-    // Get messages that need SMART processing
-    // Look for sessions with enough messages
     const { data: sessions, error } = await db.from('dev_ai_sessions')
       .select('id, project_path, started_at')
       .in('status', ['active', 'completed'])
+      .eq('terminal_port', config.TERMINAL_PORT || 5400)
       .order('started_at', { ascending: false })
       .limit(20);
 
@@ -98,7 +94,6 @@ async function smartProcess(batchSize = 50) {
 
     for (const session of sessions) {
       try {
-        // Get messages for this session from staging
         const { data: messages } = await db.from('dev_ai_staging')
           .select('*')
           .eq('session_id', session.id)
@@ -108,23 +103,37 @@ async function smartProcess(batchSize = 50) {
           continue;
         }
 
-        // Build conversation text
         const conversationText = messages
           .map(m => `${m.role.toUpperCase()}: ${m.content}`)
           .join('\n\n')
           .slice(0, config.MAX_CONVERSATION_LENGTH);
 
-        // Get previous context
         const previousContext = await getPreviousContext(session.project_path);
 
-        // Run SMART extraction
-        const extraction = await smartExtractor.extract(conversationText, {
+        // Try FREE pattern extraction first
+    const patternResult = smartPatterns.extract(messages);
+    
+    // If patterns found enough, use that (FREE)
+    if (patternResult.items && patternResult.items.length >= 2) {
+      logger.info('Using pattern extraction (FREE)', { sessionId: session.id,
+        itemCount: patternResult.items.length 
+      });
+      const validated = validator.validateExtraction(patternResult);
+      const susanData = validator.toSusanFormat(validated);
+      await susanClient.sendExtraction(session.id, session.project_path, susanData);
+      await storeSmartExtraction(session.id, patternResult, session.project_path);
+      continue;
+    }
+    
+    // Only call AI if patterns didn't find much (COSTS MONEY)
+    logger.info('Falling back to AI extraction', { sessionId: session.id });
+    const extraction = await smartExtractor.extract(conversationText, {
           projectPath: session.project_path,
           previousContext
         });
 
         if (extraction) {
-          // Validate extraction
+          // Validate extraction (handles both formats)
           const validated = validator.validateExtraction(extraction);
 
           // Convert to Susan format
@@ -133,14 +142,14 @@ async function smartProcess(batchSize = 50) {
           // Send to Susan
           await susanClient.sendExtraction(session.id, session.project_path, susanData);
 
-          // Store smart extraction
-          await storeSmartExtraction(session.id, validated);
+          // Store smart extraction with bucket support
+          await storeSmartExtraction(session.id, validated, session.project_path);
 
           processed++;
         }
 
       } catch (err) {
-        logger.error('Smart process session failed', { sessionId: session.id, error: err.message });
+        logger.error("Smart process session failed", { sessionId: session.id, error: err.message });
         errors++;
       }
     }
@@ -208,21 +217,55 @@ async function getPreviousContext(projectPath) {
 }
 
 /**
- * Store smart extraction
+ * Store smart extraction - handles BOTH legacy and 20-bucket formats
  */
-async function storeSmartExtraction(sessionId, extraction) {
+async function storeSmartExtraction(sessionId, extraction, projectPath) {
   try {
+    // NEW FORMAT: items array with bucket field
+    if (extraction.format === 'bucket' && extraction.items && Array.isArray(extraction.items)) {
+      for (const item of extraction.items) {
+        await db.from('dev_ai_smart_extractions').insert({
+          session_id: sessionId,
+          project_path: projectPath,
+          bucket: item.bucket,
+          category: item.bucket,  // Also store as category for backwards compat
+          title: item.title,
+          content: item.content || item.title,
+          priority: 'medium',
+          metadata: JSON.stringify({
+            confidence: item.confidence,
+            keywords: item.keywords,
+            relatedFiles: item.relatedFiles,
+            products: item.products || []  // ADDED: products for content-based routing
+          }),
+          status: 'pending',
+          created_at: new Date().toISOString()
+        });
+      }
+      
+      logger.info('Stored bucket items', { 
+        sessionId,
+        count: extraction.items.length,
+        buckets: [...new Set(extraction.items.map(i => i.bucket))]
+      });
+      return;
+    }
+
+    // LEGACY FORMAT: sessionSummary, problems, decisions, etc.
     await db.from('dev_ai_smart_extractions').insert({
       session_id: sessionId,
-      project_path: extraction.sessionSummary?.projectPath,
+      project_path: extraction.sessionSummary?.projectPath || projectPath,
       session_summary: JSON.stringify(extraction.sessionSummary),
       continuity: JSON.stringify(extraction.continuity),
       problems: JSON.stringify(extraction.problems || []),
       decisions: JSON.stringify(extraction.decisions || []),
       discoveries: JSON.stringify(extraction.discoveries || []),
       dependencies: JSON.stringify(extraction.dependencies || []),
+      status: 'pending',
       created_at: new Date().toISOString()
     });
+    
+    logger.debug('Stored legacy extraction', { sessionId });
   } catch (err) {
     logger.debug('Could not store smart extraction', { error: err.message });
   }
