@@ -1,6 +1,6 @@
 require("dotenv").config({ path: __dirname + "/../.env" });
 /**
- * Jen 5407 - The Scrubber
+ * Jen 5402 - The Scrubber
  * Processes raw captured data from Chad, cleans/extracts/validates, sends to Susan
  */
 

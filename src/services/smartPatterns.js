@@ -1,196 +1,177 @@
 /**
- * Smart Patterns - Regex-based extraction (FREE, no API)
- * Catches 80% of categorization without AI
+ * Smart Patterns v3.0 - STRUCTURE Item Detection
+ *
+ * This module handles LITERAL pass-through of structured content:
+ * - Database schemas (CREATE TABLE, columns)
+ * - File structure trees (directory listings)
+ * - Code blocks (```language...```)
+ * - API patterns (routes, endpoints)
+ *
+ * These don't need AI synthesis - just detect and pass through.
+ * Project ID comes from session path.
  */
 
-const { Logger } = require('../lib/logger');
-const logger = new Logger('Jen:SmartPatterns');
-
-// File path patterns
-const FILE_PATH_PATTERNS = [
-  /[A-Z]:\[^\s"'<>|]+/gi,                    // Windows paths
-  /[A-Z]:\[^\s"'<>|]+/gi,                       // Windows paths alt
-  /\/(?:var|home|usr|etc|www|opt)[\/\w\-\.]+/gi,  // Linux paths
-  /\.\/[\w\-\.\/]+/g,                              // Relative paths
-  /[\w\-]+\.(?:js|ts|jsx|tsx|json|md|css|html|sql|py|sh)/gi  // Files with extensions
-];
-
-// Code snippet patterns
-const SNIPPET_PATTERNS = [
-  //g,                               // Markdown code blocks
-  /\bfunction\s+\w+\s*\([^)]*\)/g,                // Function definitions
-  /\bconst\s+\w+\s*=\s*(?:async\s*)?\([^)]*\)\s*=>/g,  // Arrow functions
-  /\bclass\s+\w+/g,                                // Class definitions
-  /\bimport\s+.*?from\s+['][^"]+[]/g,         // ES imports
-  /\brequire\s*\(['][^"]+[]\)/g               // CommonJS requires
-];
-
-// Command patterns
-const COMMAND_PATTERNS = [
-  /\b(?:npm|yarn|pnpm)\s+(?:run\s+)?\w+/gi,
-  /\bgit\s+\w+(?:\s+[\w\-\.\/]+)*/gi,
-  /\bpm2\s+\w+/gi,
-  /\bcurl\s+[^\n]+/gi,
-  /\bssh\s+[^\n]+/gi,
-  /\bnode\s+[^\n]+/gi
-];
-
-// Decision indicators
-const DECISION_WORDS = [
-  /\b(?:decided|choosing|went with|picked|selected|using|switched to)\b/gi,
-  /\b(?:instead of|rather than|better to|should use|will use)\b/gi,
-  /\b(?:the fix|the solution|the approach)\b/gi
-];
-
-// Todo indicators  
-const TODO_WORDS = [
-  /\b(?:TODO|FIXME|HACK|XXX)\b/g,
-  /\b(?:need to|should|must|have to|gonna|going to)\s+\w+/gi,
-  /\b(?:next step|later|tomorrow|eventually)\b/gi
-];
-
-// Journal/casual indicators
-const JOURNAL_WORDS = [
-  /\b(?:lol|haha|lmao|joke|kidding|funny)\b/gi,
-  /\b(?:frustrated|annoying|stupid|dumb|argh|ugh)\b/gi,
-  /\b(?:finally|phew|yay|woohoo|nice)\b/gi
-];
-
-// Work log indicators
-const WORKLOG_WORDS = [
-  /\b(?:fixed|updated|changed|modified|created|added|removed|deleted)\b/gi,
-  /\b(?:works now|working|done|completed|finished)\b/gi,
-  /\b(?:restarted|deployed|pushed|committed)\b/gi
-];
-
-// Actual bug indicators (strict)
-const BUG_WORDS = [
-  /\b(?:TypeError|ReferenceError|SyntaxError|Error):/gi,
-  /\bstack trace\b/gi,
-  /\bcrash(?:ed|ing|es)?\b/gi,
-  /\bexception\b/gi,
-  /\bsegfault\b/gi
-];
+const { Logger } = require("../lib/logger");
+const logger = new Logger("Jen:SmartPatterns");
 
 /**
- * Extract and categorize using patterns only (FREE)
+ * Extract STRUCTURE items from messages
+ * Returns literal content - no synthesis needed
  */
-function extract(messages) {
+function extract(messages, sessionCwd) {
   const items = [];
-  const fullText = messages.map(m => m.content || '').join('\n');
-  
-  // Extract file paths → File Structure
-  for (const pattern of FILE_PATH_PATTERNS) {
-    const matches = fullText.match(pattern) || [];
-    matches.forEach(match => {
-      if (match.length > 5 && !items.find(i => i.content === match)) {
-        items.push({
-          bucket: 'File Structure',
-          title: 'File path mentioned',
-          content: match.trim(),
-          confidence: 0.9,
-          source: 'pattern'
-        });
-      }
-    });
-  }
-  
-  // Extract code snippets → Snippets
-  for (const pattern of SNIPPET_PATTERNS) {
-    const matches = fullText.match(pattern) || [];
-    matches.slice(0, 5).forEach(match => {
-      if (match.length > 20) {
-        items.push({
-          bucket: 'Snippets',
-          title: 'Code snippet',
-          content: match.substring(0, 500),
-          confidence: 0.95,
-          source: 'pattern'
-        });
-      }
-    });
-  }
-  
-  // Extract commands → Reference
-  for (const pattern of COMMAND_PATTERNS) {
-    const matches = fullText.match(pattern) || [];
-    matches.forEach(match => {
-      items.push({
-        bucket: 'Reference',
-        title: 'Command used',
-        content: match.trim(),
-        confidence: 0.9,
-        source: 'pattern'
-      });
-    });
-  }
-  
-  // Check for decisions
-  let decisionCount = 0;
-  DECISION_WORDS.forEach(p => {
-    decisionCount += (fullText.match(p) || []).length;
-  });
-  
-  // Check for todos
-  let todoCount = 0;
-  TODO_WORDS.forEach(p => {
-    todoCount += (fullText.match(p) || []).length;
-  });
-  
-  // Check for journal/casual
-  let journalCount = 0;
-  JOURNAL_WORDS.forEach(p => {
-    journalCount += (fullText.match(p) || []).length;
-  });
-  
-  // Check for work log
-  let worklogCount = 0;
-  WORKLOG_WORDS.forEach(p => {
-    worklogCount += (fullText.match(p) || []).length;
-  });
-  
-  // Check for actual bugs (strict)
-  let bugCount = 0;
-  BUG_WORDS.forEach(p => {
-    bugCount += (fullText.match(p) || []).length;
-  });
-  
-  // Determine primary category for the batch
-  const counts = {
-    'Decisions': decisionCount,
-    'Todos': todoCount,
-    'Journal': journalCount,
-    'Work Log': worklogCount,
-    'Bugs Open': bugCount
-  };
-  
-  const primary = Object.entries(counts)
-    .sort((a, b) => b[1] - a[1])
-    .filter(([cat, count]) => count > 0)[0];
-  
-  if (primary && primary[1] > 0) {
+  const fullText = messages.map(m => m.content || "").join("\n\n");
+  const seen = new Set();
+
+  // Helper to add item with deduplication
+  const addItem = (bucket, title, content, confidence = 0.9) => {
+    // Dedupe by content hash
+    const key = bucket + ":" + content.substring(0, 100).replace(/\s/g, '');
+    if (seen.has(key)) return;
+    if (content.length < 20) return; // Too short
+
+    seen.add(key);
     items.push({
-      bucket: primary[0],
-      title: 'Session activity',
-      content: fullText.substring(0, 300),
-      confidence: Math.min(0.7 + (primary[1] * 0.05), 0.95),
-      source: 'pattern'
+      bucket,
+      title: title.substring(0, 100),
+      content: content.substring(0, 2000),
+      confidence,
+      source: "pattern",
+      isStructure: true
     });
-  }
-  
-  logger.info('Pattern extraction complete', {
-    itemCount: items.length,
-    buckets: [...new Set(items.map(i => i.bucket))],
-    counts
-  });
-  
-  return {
-    items,
-    format: 'bucket',
-    patternOnly: true,
-    sessionSummary: null,
-    newKeywords: []
   };
+
+  // ============ DATABASE PATTERNS ============
+  // CREATE TABLE statements
+  const createTables = fullText.match(/CREATE\s+TABLE\s+[\w"`\[\]]+\s*\([^;]+\);?/gi) || [];
+  createTables.forEach(sql => {
+    const tableName = sql.match(/CREATE\s+TABLE\s+["`\[\]]?([\w]+)/i)?.[1] || 'table';
+    addItem("Database Patterns", `Schema: ${tableName}`, sql.trim(), 0.95);
+  });
+
+  // ALTER TABLE statements
+  const alterTables = fullText.match(/ALTER\s+TABLE\s+[\w"`\[\]]+\s+(?:ADD|DROP|MODIFY|ALTER)[^;]+;?/gi) || [];
+  alterTables.forEach(sql => {
+    const tableName = sql.match(/ALTER\s+TABLE\s+["`\[\]]?([\w]+)/i)?.[1] || 'table';
+    addItem("Database Patterns", `Alter: ${tableName}`, sql.trim(), 0.9);
+  });
+
+  // RLS policies
+  const policies = fullText.match(/CREATE\s+POLICY\s+[\w"`]+[^;]+;?/gi) || [];
+  policies.forEach(sql => {
+    addItem("Database Patterns", "RLS Policy", sql.trim(), 0.9);
+  });
+
+  // ============ FILE STRUCTURE ============
+  // Directory tree listings (indented with ├── or └── or spaces)
+  const treeListing = fullText.match(/(?:^|\n)[\s│]*[├└─┬]\s*[\w\-\.\/]+(?:\n[\s│]*[├└─┬│\s]*[\w\-\.\/]+)*/gm) || [];
+  treeListing.forEach(tree => {
+    if (tree.split('\n').length >= 3) { // At least 3 lines
+      addItem("File Structure", "Directory Tree", tree.trim(), 0.9);
+    }
+  });
+
+  // Folder structure descriptions
+  const folderDesc = fullText.match(/(?:^|\n)(?:src|app|lib|components|pages|api)\/[\w\-\/]+(?:\n\s*[-*]\s*[\w\-\/\.]+)*/gm) || [];
+  folderDesc.forEach(desc => {
+    if (desc.split('\n').length >= 2) {
+      addItem("File Structure", "Folder Layout", desc.trim(), 0.85);
+    }
+  });
+
+  // ============ API PATTERNS ============
+  // Express/Next.js route definitions
+  const routes = fullText.match(/(?:router|app)\.(get|post|put|patch|delete)\s*\(\s*['"`][^'"`]+['"`]/gi) || [];
+  routes.forEach(route => {
+    addItem("API Patterns", "Route Definition", route.trim(), 0.9);
+  });
+
+  // API endpoint paths with methods
+  const endpoints = fullText.match(/(?:GET|POST|PUT|PATCH|DELETE)\s+\/[\w\-\/\:]+/gi) || [];
+  endpoints.forEach(ep => {
+    addItem("API Patterns", "Endpoint", ep.trim(), 0.85);
+  });
+
+  // OpenAPI/Swagger paths
+  const swaggerPaths = fullText.match(/['"`]\/[\w\-\/\{\}:]+['"`]\s*:\s*\{[^}]+\}/gi) || [];
+  swaggerPaths.forEach(path => {
+    addItem("API Patterns", "API Path", path.trim(), 0.85);
+  });
+
+  // ============ COMPONENT PATTERNS ============
+  // React component exports
+  const components = fullText.match(/export\s+(?:default\s+)?(?:function|const)\s+[\w]+\s*(?:\([^)]*\)|=)/gi) || [];
+  components.forEach(comp => {
+    const name = comp.match(/(?:function|const)\s+([\w]+)/)?.[1];
+    if (name && name[0] === name[0].toUpperCase()) { // PascalCase = component
+      addItem("Component Patterns", `Component: ${name}`, comp.trim(), 0.85);
+    }
+  });
+
+  // ============ SNIPPETS ============
+  // Code blocks with language tag
+  const codeBlocks = fullText.match(/```(?:js|javascript|ts|typescript|jsx|tsx|sql|python|bash|sh|css|json)[\s\S]*?```/gi) || [];
+  codeBlocks.forEach(block => {
+    const lang = block.match(/```(\w+)/)?.[1] || 'code';
+    const code = block.replace(/```\w*\n?/, '').replace(/```$/, '').trim();
+    if (code.length > 30 && code.split('\n').length >= 2) {
+      addItem("Snippets", `${lang} snippet`, code, 0.9);
+    }
+  });
+
+  // ============ NAMING CONVENTIONS ============
+  // Explicit naming patterns
+  const namingPatterns = fullText.match(/(?:named?|naming|convention|pattern)\s*(?:is|are|:)\s*[^\n]+/gi) || [];
+  namingPatterns.forEach(pattern => {
+    addItem("Naming Conventions", "Naming Pattern", pattern.trim(), 0.85);
+  });
+
+  // File naming patterns
+  const fileNaming = fullText.match(/(?:files?\s+(?:are|should be)\s+named|\.(?:tsx?|jsx?|css|json)\s+files?\s+(?:are|use))[^\n]+/gi) || [];
+  fileNaming.forEach(pattern => {
+    addItem("Naming Conventions", "File Naming", pattern.trim(), 0.85);
+  });
+
+  // ============ SCHEMATIC ============
+  // ASCII flow diagrams
+  const flowDiagrams = fullText.match(/(?:^|\n)[^\n]*(?:→|->|=>|──>|---).*(?:\n[^\n]*(?:→|->|=>|│|\|)[^\n]*)+/gm) || [];
+  flowDiagrams.forEach(diagram => {
+    if (diagram.split('\n').length >= 2) {
+      addItem("Schematic", "Flow Diagram", diagram.trim(), 0.9);
+    }
+  });
+
+  // Box diagrams
+  const boxDiagrams = fullText.match(/(?:^|\n)\s*[┌╔┏][─═━]+[┐╗┓](?:\n[^\n]+)+\n\s*[└╚┗][─═━]+[┘╝┛]/gm) || [];
+  boxDiagrams.forEach(diagram => {
+    addItem("Schematic", "Box Diagram", diagram.trim(), 0.9);
+  });
+
+  // Log results
+  const counts = {};
+  items.forEach(i => counts[i.bucket] = (counts[i.bucket] || 0) + 1);
+  logger.info("Structure extraction complete", { itemCount: items.length, counts });
+
+  return { items, counts, isStructureOnly: true };
 }
 
-module.exports = { extract };
+/**
+ * Check if content has substantial structure items
+ * Used to decide if we need AI extraction too
+ */
+function hasStructureContent(messages) {
+  const fullText = messages.map(m => m.content || "").join("\n");
+
+  // Check for code blocks
+  if (/```\w+[\s\S]*?```/.test(fullText)) return true;
+
+  // Check for SQL
+  if (/CREATE\s+TABLE|ALTER\s+TABLE|CREATE\s+POLICY/i.test(fullText)) return true;
+
+  // Check for tree structure
+  if (/[├└─┬│]/.test(fullText)) return true;
+
+  return false;
+}
+
+module.exports = { extract, hasStructureContent };

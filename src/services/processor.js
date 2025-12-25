@@ -1,278 +1,442 @@
 /**
- * Jen Processor Service
- * The brain of Jen - all pattern recognition, AI extraction, and validation
- * Supports BOTH legacy format AND new 20-bucket format
+ * Jen Processor v3.0 - Contextual Extraction with Substance
+ *
+ * ARCHITECTURE:
+ * 1. Get session with project_id (cwd/path)
+ * 2. Run smartPatterns for STRUCTURE items (literal pass-through)
+ * 3. Run smartExtractor for SUBSTANCE items (contextual AI synthesis)
+ * 4. Use session path for project detection (primary)
+ * 5. Write items to destination tables with status='flagged'
+ *
+ * QUALITY > QUANTITY
  */
 
 const { Logger } = require('../lib/logger');
 const db = require('../lib/db');
 const config = require('../lib/config');
-const patternExtractor = require('./patternExtractor');
 const smartExtractor = require('./smartExtractor');
 const smartPatterns = require('./smartPatterns');
-const validator = require('./validator');
-const susanClient = require('./susanClient');
 
 const logger = new Logger('Jen:Processor');
 
+// 20 buckets → destination tables
+const BUCKET_TO_TABLE = {
+  'Bugs Open': 'dev_ai_bugs',
+  'Bugs Fixed': 'dev_ai_bugs',
+  'Todos': 'dev_ai_todos',
+  'Journal': 'dev_ai_journal',
+  'Work Log': 'dev_ai_journal',
+  'Ideas': 'dev_ai_knowledge',
+  'Decisions': 'dev_ai_decisions',
+  'Lessons': 'dev_ai_lessons',
+  'System Breakdown': 'dev_ai_docs',
+  'How-To Guide': 'dev_ai_docs',
+  'Schematic': 'dev_ai_docs',
+  'Reference': 'dev_ai_docs',
+  'Naming Conventions': 'dev_ai_conventions',
+  'File Structure': 'dev_ai_conventions',
+  'Database Patterns': 'dev_ai_conventions',
+  'API Patterns': 'dev_ai_conventions',
+  'Component Patterns': 'dev_ai_conventions',
+  'Quirks & Gotchas': 'dev_ai_knowledge',
+  'Snippets': 'dev_ai_snippets',
+  'Other': 'dev_ai_knowledge'
+};
+
+// Project path → UUID cache
+let projectPathCache = {};
+
 /**
- * Initialize the processor
+ * Initialize - load project path mappings
  */
 async function initialize() {
-  logger.info('Processor initialized');
+  await loadProjectCache();
+  logger.info('Processor initialized', { projectCount: Object.keys(projectPathCache).length });
   return true;
 }
 
 /**
- * Quick process - pattern matching only, no AI
- * Runs frequently to catch obvious patterns quickly
+ * Load project slugs for path matching
  */
-async function quickProcess(batchSize = 50) {
+async function loadProjectCache() {
+  try {
+    const { data: projects } = await db.from('dev_projects')
+      .select('id, name, slug, parent_id, client_id');
+
+    if (projects) {
+      projectPathCache = {};
+      for (const p of projects) {
+        // Cache by slug and name variations
+        const slug = (p.slug || '').toLowerCase();
+        const name = (p.name || '').toLowerCase();
+
+        if (slug) projectPathCache[slug] = p;
+        if (name) projectPathCache[name] = p;
+
+        // Also cache without port numbers (ai-jen-5402 → ai-jen)
+        const slugNoPort = slug.replace(/-\d{4}$/, '');
+        if (slugNoPort !== slug) projectPathCache[slugNoPort] = p;
+      }
+    }
+  } catch (err) {
+    logger.error('Failed to load project cache', { error: err.message });
+  }
+}
+
+/**
+ * Process active sessions - main entry point
+ */
+async function process(batchSize = 20) {
   let processed = 0;
   let errors = 0;
+  let itemCount = 0;
 
   try {
-    const { data: messages, error } = await db.from('dev_ai_staging')
-      .select('*')
-      .eq('processed', false)
-      .order('captured_at', { ascending: true })
+    // Get active sessions WITH project_id (the cwd/path)
+    const { data: sessions, error } = await db.from('dev_ai_sessions')
+      .select('id, started_at, project_id, raw_content')
+      .eq('status', 'active')
+      .order('started_at', { ascending: true })
       .limit(batchSize);
 
     if (error) throw error;
-    if (!messages || messages.length === 0) {
-      return { processed: 0, errors: 0 };
-    }
-
-    const sessionGroups = groupBySession(messages);
-
-    for (const [sessionId, sessionMessages] of Object.entries(sessionGroups)) {
-      try {
-        const patterns = patternExtractor.extract(sessionMessages);
-
-        if (patterns.hasData) {
-          await susanClient.sendQuickPatterns(sessionId, sessionMessages[0].project_path, patterns);
-        }
-
-        const ids = sessionMessages.map(m => m.id);
-        await markProcessed(ids, 'quick');
-        processed += sessionMessages.length;
-
-      } catch (err) {
-        logger.error('Quick process session failed', { sessionId, error: err.message });
-        errors++;
-      }
-    }
-
-  } catch (err) {
-    logger.error('Quick process batch failed', { error: err.message });
-    errors++;
-  }
-
-  return { processed, errors };
-}
-
-/**
- * Smart process - AI extraction
- * Runs less frequently for deep analysis
- */
-async function smartProcess(batchSize = 50) {
-  let processed = 0;
-  let errors = 0;
-
-  try {
-    const { data: sessions, error } = await db.from('dev_ai_sessions')
-      .select('id, project_path, started_at')
-      .in('status', ['active', 'completed'])
-      .eq('terminal_port', config.TERMINAL_PORT || 5400)
-      .order('started_at', { ascending: false })
-      .limit(20);
-
-    if (error) throw error;
     if (!sessions || sessions.length === 0) {
-      return { processed: 0, errors: 0 };
+      return { processed: 0, errors: 0, items: 0 };
     }
+
+    logger.info('Processing sessions', { count: sessions.length });
 
     for (const session of sessions) {
       try {
-        const { data: messages } = await db.from('dev_ai_staging')
-          .select('*')
-          .eq('session_id', session.id)
-          .order('captured_at', { ascending: true });
-
-        if (!messages || messages.length < config.MIN_MESSAGES_FOR_SMART) {
-          continue;
-        }
-
-        const conversationText = messages
-          .map(m => `${m.role.toUpperCase()}: ${m.content}`)
-          .join('\n\n')
-          .slice(0, config.MAX_CONVERSATION_LENGTH);
-
-        const previousContext = await getPreviousContext(session.project_path);
-
-        // Try FREE pattern extraction first
-    const patternResult = smartPatterns.extract(messages);
-    
-    // If patterns found enough, use that (FREE)
-    if (patternResult.items && patternResult.items.length >= 2) {
-      logger.info('Using pattern extraction (FREE)', { sessionId: session.id,
-        itemCount: patternResult.items.length 
-      });
-      const validated = validator.validateExtraction(patternResult);
-      const susanData = validator.toSusanFormat(validated);
-      await susanClient.sendExtraction(session.id, session.project_path, susanData);
-      await storeSmartExtraction(session.id, patternResult, session.project_path);
-      continue;
-    }
-    
-    // Only call AI if patterns didn't find much (COSTS MONEY)
-    logger.info('Falling back to AI extraction', { sessionId: session.id });
-    const extraction = await smartExtractor.extract(conversationText, {
-          projectPath: session.project_path,
-          previousContext
-        });
-
-        if (extraction) {
-          // Validate extraction (handles both formats)
-          const validated = validator.validateExtraction(extraction);
-
-          // Convert to Susan format
-          const susanData = validator.toSusanFormat(validated);
-
-          // Send to Susan
-          await susanClient.sendExtraction(session.id, session.project_path, susanData);
-
-          // Store smart extraction with bucket support
-          await storeSmartExtraction(session.id, validated, session.project_path);
-
+        const result = await processSession(session);
+        if (result.success) {
           processed++;
+          itemCount += result.items;
         }
-
       } catch (err) {
-        logger.error("Smart process session failed", { sessionId: session.id, error: err.message });
+        logger.error('Session failed', { sessionId: session.id, error: err.message });
         errors++;
       }
     }
 
   } catch (err) {
-    logger.error('Smart process batch failed', { error: err.message });
+    logger.error('Process batch failed', { error: err.message });
     errors++;
   }
 
-  return { processed, errors };
+  logger.info('Process complete', { processed, errors, items: itemCount });
+  return { processed, errors, items: itemCount };
 }
 
 /**
- * Group messages by session ID
+ * Process a single session
  */
-function groupBySession(messages) {
-  const groups = {};
-  for (const msg of messages) {
-    const key = msg.session_id || 'no-session';
-    if (!groups[key]) groups[key] = [];
-    groups[key].push(msg);
-  }
-  return groups;
-}
+async function processSession(session) {
+  // Use raw_content directly if available, otherwise get from staging
+  let conversationText = session.raw_content;
 
-/**
- * Mark messages as processed
- */
-async function markProcessed(ids, processedBy) {
-  try {
-    for (const id of ids) {
-      await db.from('dev_ai_staging')
-        .update({ 
-          processed: true, 
-          processed_at: new Date().toISOString(),
-          processed_by: processedBy
-        })
-        .eq('id', id);
+  if (!conversationText || conversationText.length < 100) {
+    // Fall back to staging table
+    const { data: messages } = await db.from('dev_ai_staging')
+      .select('*')
+      .eq('session_id', session.id)
+      .order('captured_at', { ascending: true });
+
+    if (!messages || messages.length < 3) {
+      await markSessionProcessed(session.id, 0);
+      return { success: false, items: 0, reason: 'not enough content' };
     }
-  } catch (err) {
-    logger.error('Failed to mark processed', { error: err.message });
+
+    conversationText = messages
+      .map(m => (m.role || 'unknown').toUpperCase() + ': ' + (m.content || ''))
+      .join('\n\n');
   }
-}
 
-/**
- * Get previous context for continuity
- */
-async function getPreviousContext(projectPath) {
-  try {
-    const { data } = await db.from('dev_ai_smart_extractions')
-      .select('continuity, session_summary')
-      .eq('project_path', projectPath)
-      .order('created_at', { ascending: false })
-      .limit(1);
+  // Limit to 50k chars for AI
+  conversationText = conversationText.slice(0, 50000);
 
-    if (data?.[0]) {
-      const summary = data[0].session_summary;
-      const continuity = data[0].continuity;
-      return `Previous: ${summary?.mainGoal || 'Unknown'}\nIn progress: ${continuity?.inProgress || 'None'}`;
-    }
-    return null;
-  } catch {
-    return null;
+  // Detect project from session path FIRST
+  const projectUuids = detectProjectFromPath(session.project_id);
+
+  logger.info('Session processing', {
+    sessionId: session.id,
+    sessionPath: session.project_id,
+    detectedProject: projectUuids.project_id ? 'found' : 'null',
+    contentLength: conversationText.length
+  });
+
+  // Collect all items
+  let allItems = [];
+
+  // 1. STRUCTURE items - literal pass-through (FREE)
+  const structureResult = smartPatterns.extract(
+    [{ content: conversationText }],
+    session.project_id
+  );
+  if (structureResult && structureResult.items) {
+    allItems.push(...structureResult.items);
+    logger.info('Structure items found', { count: structureResult.items.length });
   }
-}
 
-/**
- * Store smart extraction - handles BOTH legacy and 20-bucket formats
- */
-async function storeSmartExtraction(sessionId, extraction, projectPath) {
-  try {
-    // NEW FORMAT: items array with bucket field
-    if (extraction.format === 'bucket' && extraction.items && Array.isArray(extraction.items)) {
-      for (const item of extraction.items) {
-        await db.from('dev_ai_smart_extractions').insert({
-          session_id: sessionId,
-          project_path: projectPath,
-          bucket: item.bucket,
-          category: item.bucket,  // Also store as category for backwards compat
-          title: item.title,
-          content: item.content || item.title,
-          priority: 'medium',
-          metadata: JSON.stringify({
-            confidence: item.confidence,
-            keywords: item.keywords,
-            relatedFiles: item.relatedFiles,
-            products: item.products || []  // ADDED: products for content-based routing
-          }),
-          status: 'pending',
-          created_at: new Date().toISOString()
-        });
+  // 2. SUBSTANCE items - contextual AI extraction
+  // Always run this for quality extraction
+  const substanceResult = await smartExtractor.extract(conversationText, {
+    sessionCwd: session.project_id,
+    projectPath: session.project_id
+  });
+
+  if (substanceResult && substanceResult.items) {
+    // AI may also detect project
+    if (substanceResult.detectedProject && !projectUuids.project_id) {
+      const aiProject = detectProjectFromPath(substanceResult.detectedProject);
+      if (aiProject.project_id) {
+        projectUuids.project_id = aiProject.project_id;
+        projectUuids.client_id = aiProject.client_id;
+        projectUuids.parent_id = aiProject.parent_id;
       }
-      
-      logger.info('Stored bucket items', { 
-        sessionId,
-        count: extraction.items.length,
-        buckets: [...new Set(extraction.items.map(i => i.bucket))]
-      });
-      return;
     }
 
-    // LEGACY FORMAT: sessionSummary, problems, decisions, etc.
-    await db.from('dev_ai_smart_extractions').insert({
-      session_id: sessionId,
-      project_path: extraction.sessionSummary?.projectPath || projectPath,
-      session_summary: JSON.stringify(extraction.sessionSummary),
-      continuity: JSON.stringify(extraction.continuity),
-      problems: JSON.stringify(extraction.problems || []),
-      decisions: JSON.stringify(extraction.decisions || []),
-      discoveries: JSON.stringify(extraction.discoveries || []),
-      dependencies: JSON.stringify(extraction.dependencies || []),
-      status: 'pending',
-      created_at: new Date().toISOString()
-    });
-    
-    logger.debug('Stored legacy extraction', { sessionId });
+    allItems.push(...substanceResult.items);
+    logger.info('Substance items found', { count: substanceResult.items.length });
+  }
+
+  if (allItems.length === 0) {
+    await markSessionProcessed(session.id, 0);
+    return { success: true, items: 0 };
+  }
+
+  // Deduplicate items by content similarity
+  allItems = deduplicateItems(allItems);
+
+  // Write items to destination tables
+  let itemsWritten = 0;
+  for (const item of allItems) {
+    const success = await writeItem(item, session.id, projectUuids);
+    if (success) itemsWritten++;
+  }
+
+  await markSessionProcessed(session.id, itemsWritten);
+
+  logger.info('Session complete', {
+    sessionId: session.id,
+    items: itemsWritten,
+    buckets: [...new Set(allItems.map(i => i.bucket))]
+  });
+
+  return { success: true, items: itemsWritten };
+}
+
+/**
+ * Detect project UUID from path/cwd
+ */
+function detectProjectFromPath(pathOrCwd) {
+  const result = { client_id: null, parent_id: null, project_id: null };
+
+  if (!pathOrCwd) return result;
+
+  // Normalize path
+  const path = pathOrCwd.toLowerCase().replace(/\\/g, '/');
+
+  // Extract potential project name from path
+  // e.g., "C:/Projects/Studio/kodiack-studio" → "kodiack-studio"
+  // e.g., "/var/www/Studio/ai-team/ai-jen-5402" → "ai-jen-5402"
+  const parts = path.split('/').filter(Boolean);
+
+  // Try each part from end to beginning
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i];
+
+    // Try exact match
+    if (projectPathCache[part]) {
+      const project = projectPathCache[part];
+      result.project_id = project.id;
+      result.client_id = project.client_id;
+      result.parent_id = project.parent_id;
+      return result;
+    }
+
+    // Try without port number
+    const partNoPort = part.replace(/-\d{4}$/, '');
+    if (projectPathCache[partNoPort]) {
+      const project = projectPathCache[partNoPort];
+      result.project_id = project.id;
+      result.client_id = project.client_id;
+      result.parent_id = project.parent_id;
+      return result;
+    }
+
+    // Try partial match (kodiack-studio → kodiack-dashboard)
+    for (const [key, project] of Object.entries(projectPathCache)) {
+      if (key.includes(part) || part.includes(key)) {
+        result.project_id = project.id;
+        result.client_id = project.client_id;
+        result.parent_id = project.parent_id;
+        return result;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Deduplicate items by title/content similarity
+ */
+function deduplicateItems(items) {
+  const seen = new Map();
+
+  return items.filter(item => {
+    // Create a key from bucket + normalized title
+    const titleKey = (item.title || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 50);
+    const key = item.bucket + ':' + titleKey;
+
+    if (seen.has(key)) {
+      // If duplicate, keep the one with more content
+      const existing = seen.get(key);
+      if ((item.content || '').length > (existing.content || '').length) {
+        seen.set(key, item);
+      }
+      return false;
+    }
+
+    seen.set(key, item);
+    return true;
+  });
+}
+
+/**
+ * Write item to destination table
+ */
+async function writeItem(item, sessionId, uuids) {
+  const table = BUCKET_TO_TABLE[item.bucket] || 'dev_ai_knowledge';
+
+  const baseRecord = {
+    client_id: uuids.client_id,
+    parent_id: uuids.parent_id,
+    project_id: uuids.project_id,
+    bucket: item.bucket,
+    keywords: JSON.stringify(item.keywords || []),
+    source_session_id: sessionId,
+    status: 'flagged',
+    created_at: new Date().toISOString()
+  };
+
+  try {
+    if (table === 'dev_ai_todos') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || item.content || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    }
+    else if (table === 'dev_ai_bugs') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || item.content || '').substring(0, 200),
+        description: item.content || item.title,
+        severity: 'medium'
+      });
+    }
+    else if (table === 'dev_ai_knowledge') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || item.content || '').substring(0, 200),
+        content: item.content || item.title,
+        category: item.bucket
+      });
+    }
+    else if (table === 'dev_ai_docs') {
+      const docTypeMap = {
+        'System Breakdown': 'breakdown',
+        'How-To Guide': 'howto',
+        'Schematic': 'schematic',
+        'Reference': 'reference'
+      };
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || item.content || '').substring(0, 200),
+        content: item.content || item.title,
+        doc_type: docTypeMap[item.bucket] || 'reference'
+      });
+    }
+    else if (table === 'dev_ai_conventions') {
+      const convTypeMap = {
+        'Naming Conventions': 'naming',
+        'File Structure': 'structure',
+        'Database Patterns': 'database',
+        'API Patterns': 'api',
+        'Component Patterns': 'component'
+      };
+      await db.from(table).insert({
+        ...baseRecord,
+        name: (item.title || item.content || '').substring(0, 200),
+        description: item.content || item.title,
+        convention_type: convTypeMap[item.bucket] || 'other'
+      });
+    }
+    else if (table === 'dev_ai_snippets') {
+      await db.from(table).insert({
+        ...baseRecord,
+        content: item.content || item.title,
+        snippet_type: 'extracted'
+      });
+    }
+    else if (table === 'dev_ai_decisions') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || item.content || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    }
+    else if (table === 'dev_ai_lessons') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || item.content || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    }
+    else if (table === 'dev_ai_journal') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || item.content || '').substring(0, 200),
+        content: item.content || item.title,
+        entry_type: item.bucket === 'Work Log' ? 'work_log' : 'journal'
+      });
+    }
+
+    return true;
   } catch (err) {
-    logger.debug('Could not store smart extraction', { error: err.message });
+    logger.error('Failed to write item', { table, bucket: item.bucket, error: err.message });
+    return false;
   }
 }
+
+/**
+ * Mark session as processed
+ */
+async function markSessionProcessed(sessionId, itemCount) {
+  try {
+    await db.from('dev_ai_sessions')
+      .update({
+        status: 'processed',
+        processed_at: new Date().toISOString(),
+        items_extracted: itemCount
+      })
+      .eq('id', sessionId);
+  } catch (err) {
+    logger.error('Failed to mark session processed', { error: err.message });
+  }
+}
+
+// Compatibility exports
+const quickProcess = () => process(10);
+const smartProcess = () => process(20);
 
 module.exports = {
   initialize,
+  process,
   quickProcess,
-  smartProcess
+  smartProcess,
+  detectProjectFromPath,
+  deduplicateItems
 };

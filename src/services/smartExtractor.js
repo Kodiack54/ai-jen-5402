@@ -1,8 +1,12 @@
 /**
- * Smart Extractor - AI-powered extraction with 20 bucket categories
- * Uses OpenAI to deeply understand conversations and flag items
+ * Smart Extractor v3.0 - Contextual Extraction with Substance
  *
- * v2.0: Added NextBid product family awareness for business/architecture discussions
+ * KEY PRINCIPLES:
+ * 1. Process FULL conversation as one unit
+ * 2. Extract DISTINCT, SYNTHESIZED items - NOT fragments
+ * 3. Require WHO/WHAT/WHY context for substance items
+ * 4. Deduplicate - multiple mentions = ONE item
+ * 5. Quality over quantity
  */
 
 const { Logger } = require('../lib/logger');
@@ -18,47 +22,31 @@ const BUCKETS = [
   'API Patterns', 'Component Patterns', 'Quirks & Gotchas', 'Snippets', 'Other'
 ];
 
-// NextBid Product Family - for intelligent tagging
-const PRODUCT_FAMILY = {
-  'NextBid': {
-    description: 'Government procurement platform for SERVICES (20+ tradelines)',
-    keywords: ['nextbid', 'services', 'tradeline', 'procurement', 'service contract']
-  },
-  'NextBidder': {
-    description: 'Government procurement platform for GOODS (auction-style)',
-    keywords: ['nextbidder', 'auction', 'goods', 'bidding', 'bid on items']
-  },
-  'NextBid Sources': {
-    description: 'Puppeteer scrapers for discovering government entity sources (350+ in CA alone)',
-    keywords: ['sources', 'scraper', 'puppeteer', 'entity', 'authenticate', 'discovery']
-  },
-  'NextBid Portals': {
-    description: 'User interface - CRM, Dispatch, Accounting, AI Proposals, Opportunity Matching',
-    keywords: ['portal', 'crm', 'dispatch', 'accounting', 'proposal', 'opportunity', 'user interface']
-  },
-  'NextTech': {
-    description: 'Field worker mobile app - clock in/out, view jobs, close work orders',
-    keywords: ['nexttech', 'field worker', 'mobile app', 'clock in', 'work order', 'dispatch']
-  },
-  'NextTask': {
-    description: 'Gamification layer - quests for data entry that feed the AI proposal engine',
-    keywords: ['nexttask', 'quest', 'gamification', 'points', 'game', 'upload invoice', 'competitor bid']
-  }
-};
+// Structure buckets - can be literal pass-through from code blocks
+const STRUCTURE_BUCKETS = [
+  'Database Patterns', 'File Structure', 'API Patterns',
+  'Component Patterns', 'Naming Conventions', 'Snippets', 'Schematic'
+];
+
+// Substance buckets - require WHO/WHAT/WHY context
+const SUBSTANCE_BUCKETS = [
+  'Bugs Open', 'Bugs Fixed', 'Todos', 'Ideas', 'Decisions',
+  'Lessons', 'System Breakdown', 'How-To Guide', 'Journal',
+  'Work Log', 'Reference', 'Quirks & Gotchas', 'Other'
+];
 
 /**
- * Extract insights using AI with 20 bucket categories
+ * Extract insights using AI with contextual understanding
  */
 async function extract(conversationText, options = {}) {
-  const { projectPath, previousContext } = options;
+  const { projectPath, sessionCwd } = options;
 
   try {
-    const prompt = buildExtractionPrompt(conversationText, projectPath, previousContext);
+    const prompt = buildExtractionPrompt(conversationText, projectPath, sessionCwd);
     const response = await callOpenAI(prompt);
     const parsed = parseJsonSafe(response);
 
     if (parsed) {
-      // Mark as new bucket format so processor uses 20-bucket storage
       parsed.format = 'bucket';
 
       // Validate buckets
@@ -72,122 +60,158 @@ async function extract(conversationText, options = {}) {
         });
       }
 
-      logger.info('Smart extraction successful', {
+      logger.info('Contextual extraction complete', {
         itemCount: parsed.items?.length || 0,
         buckets: [...new Set(parsed.items?.map(i => i.bucket) || [])],
-        products: [...new Set(parsed.items?.flatMap(i => i.products || []) || [])],
-        newKeywords: parsed.newKeywords?.length || 0
+        project: parsed.detectedProject || 'unknown'
       });
       return parsed;
     }
 
-    logger.warn('Smart extraction returned no data');
+    logger.warn('Extraction returned no data');
     return null;
 
   } catch (err) {
-    logger.error('Smart extraction failed', { error: err.message });
+    logger.error('Extraction failed', { error: err.message });
     return null;
   }
 }
 
 /**
- * Build the extraction prompt with 20 bucket categories and product awareness
+ * Build contextual extraction prompt
  */
-function buildExtractionPrompt(conversationText, projectPath, previousContext) {
-  return `You are Jen, an AI assistant that extracts and categorizes development session content.
+function buildExtractionPrompt(conversationText, projectPath, sessionCwd) {
+  const cwd = sessionCwd || projectPath || 'Unknown';
 
-PROJECT: ${projectPath || 'Unknown'}
+  return `You are Jen, an AI that extracts MEANINGFUL, COMPLETE items from development conversations.
 
-## BRAINSTORMING & NEW PROJECT IDEASWhen Michael mentions potential NEW projects (not NextBid family):- Travel app, finance app, other client projects, side projects- Flag as "Ideas" with keywords: ["new-project", "brainstorm", "potential"]- These are VALUABLE - capture the concept even if vague- Tag with product name if mentioned (e.g., "Travel App", "Finance App")## PRODUCT FAMILY KNOWLEDGE
-You work at Kodiack Studios which builds the NextBid ecosystem for government procurement:
+SESSION WORKING DIRECTORY: ${cwd}
 
-**NextBid** - Platform for government SERVICE contracts (20+ tradelines like plumbing, electrical, HVAC)
-**NextBidder** - Platform for government GOODS contracts (auction-style bidding on physical items)
-**NextBid Sources** - Puppeteer scrapers that discover/authenticate government entity sources (350+ in CA)
-**NextBid Portals** - User interface: CRM, Dispatch, Accounting, AI-powered proposal writing
-**NextTech** - Field worker mobile app: clock in/out, view jobs, close work orders
-**NextTask** - Gamification layer that turns data entry into quests that feed the AI proposal engine
+## CRITICAL: CONTEXTUAL EXTRACTION
 
-When conversations discuss these products, their architecture, business model, or design:
-- Flag as "System Breakdown" or "Ideas" - NOT Work Log
-- Tag the specific product(s) in the keywords
-- These are HIGH VALUE knowledge items
+You are reading a FULL conversation. Your job is to:
+1. UNDERSTAND the conversation as a whole
+2. IDENTIFY distinct topics/items discussed
+3. SYNTHESIZE complete thoughts from back-and-forth fragments
+4. Extract items with FULL CONTEXT
 
-${previousContext ? `PREVIOUS SESSION CONTEXT:\n${previousContext}\n` : ''}
+## WHAT NOT TO DO - FRAGMENTS ARE GARBAGE
 
-CONVERSATION TO ANALYZE:
+BAD (fragments - DO NOT extract these):
+- "Found it"
+- "Error"
+- "Fixed"
+- "The count was wrong"
+- "Need to add caching"
+
+These are USELESS without context. DO NOT extract individual messages.
+
+## WHAT TO DO - SYNTHESIZE COMPLETE ITEMS
+
+Read the FULL conversation. If you see:
+"""
+USER: The dashboard counts are wrong
+ASSISTANT: Looking at the API...
+USER: Found it
+ASSISTANT: The query was counting all items instead of flagged ones
+USER: Fixed it by adding the WHERE clause
+"""
+
+Extract ONE complete bug:
+{
+  "bucket": "Bugs Fixed",
+  "title": "Dashboard counts incorrect - API counting all items",
+  "content": "The /api/ai-extractions endpoint was counting ALL items instead of just flagged ones. Root cause: missing WHERE status='flagged' clause. Fixed by adding status filter to the query.",
+  "project": "kodiack-dashboard"
+}
+
+## SUBSTANCE REQUIREMENTS
+
+For Bugs, Todos, Ideas, Lessons, Decisions, How-To Guides:
+- WHAT: What is the item about? (specific, not vague)
+- WHY: Why does it matter? What problem does it solve?
+- CONTEXT: Enough detail that someone else could understand it
+
+If you cannot answer WHAT and WHY with specifics, DO NOT EXTRACT IT.
+
+## STRUCTURE ITEMS (can be more literal)
+
+For Database Patterns, File Structure, API Patterns, Snippets:
+- These often come from code blocks
+- Can be more literal/direct
+- Still need to be complete (not fragments)
+
+## DEDUPLICATION
+
+If the same topic is discussed multiple times, that is ONE item:
+- 5 messages about the same bug = 1 bug entry
+- 3 mentions of the same todo = 1 todo entry
+- Multiple back-and-forth about one idea = 1 idea entry
+
+## PROJECT DETECTION
+
+Look at the conversation context to determine the project:
+- File paths mentioned (e.g., /var/www/Studio/ai-team/ai-jen-5402)
+- Folder names (kodiack-dashboard, ai-chad, nextbidder)
+- System names discussed
+- The session working directory: ${cwd}
+
+## THE 20 BUCKETS
+
+- Bugs Open: Active bugs with error details + reproduction steps
+- Bugs Fixed: Resolved bugs with problem + cause + solution
+- Todos: Tasks to do with WHAT + WHY + WHERE
+- Journal: Session narrative (what happened overall)
+- Work Log: Technical accomplishments (what was done)
+- Ideas: Suggestions with enough context to understand the concept
+- Decisions: Choices made with reasoning
+- Lessons: Insights learned with the context that led to them
+- System Breakdown: Architecture explanations, how systems work
+- How-To Guide: Step-by-step instructions (must be complete)
+- Schematic: Diagrams, flows, visual structures
+- Reference: Useful lookup info
+- Naming Conventions: Naming patterns/rules
+- File Structure: Folder organization
+- Database Patterns: Schema, queries, table structures
+- API Patterns: Endpoint patterns
+- Component Patterns: UI patterns
+- Quirks & Gotchas: Weird behaviors with explanation
+- Snippets: Useful code (must be complete, working code)
+- Other: Valuable items that do not fit elsewhere
+
+## CONVERSATION TO ANALYZE:
+
 ${conversationText}
 
-FLAG each extracted item with ONE of these 20 bucket categories:
-- Bugs Open (ONLY actual software bugs with error messages/stack traces)
-- Bugs Fixed (problems solved in this session)
-- Todos (tasks to do later, next steps)
-- Journal (session narrative, what happened)
-- Work Log (what was accomplished - technical tasks)
-- Ideas (suggestions, potential improvements, brainstorms)
-- Decisions (choices made and why)
-- Lessons (things learned, insights)
-- System Breakdown (architecture explanations, how systems work, PRODUCT DESIGN DISCUSSIONS)
-- How-To Guide (step-by-step instructions)
-- Schematic (diagrams, flows, visual explanations)
-- Reference (useful info to look up later)
-- Naming Conventions (naming patterns, rules)
-- File Structure (folder organization)
-- Database Patterns (DB schema, queries)
-- API Patterns (endpoint patterns)
-- Component Patterns (UI component patterns)
-- Quirks & Gotchas (weird behaviors, gotchas)
-- Snippets (useful code snippets)
-- Other (doesn't fit elsewhere)
+## EXTRACTION OUTPUT
 
-Extract as JSON (MUST be valid JSON):
+Return JSON:
 {
+  "detectedProject": "project-name-from-context",
   "items": [
     {
-      "bucket": "ONE_OF_THE_20_BUCKETS",
-      "title": "Short title (max 100 chars)",
-      "content": "The actual content/description",
-      "confidence": 0.0-1.0,
-      "keywords": ["relevant", "keywords"],
-      "products": ["NextBid", "NextTask"],
-      "relatedFiles": ["file/paths/if/any.js"]
+      "bucket": "ONE_OF_20_BUCKETS",
+      "title": "Clear, specific title (max 100 chars)",
+      "content": "Complete description with full context. Someone reading this should understand the WHAT and WHY without needing to see the original conversation.",
+      "keywords": ["specific", "relevant", "keywords"],
+      "confidence": 0.8
     }
   ],
   "sessionSummary": {
-    "mainGoal": "What was the session about",
-    "outcome": "success|partial|blocked|ongoing",
-    "keyTakeaway": "Most important thing"
-  },
-  "newKeywords": ["new_terms", "discovered_that_should_be_learned"]
+    "mainGoal": "What was the session trying to accomplish",
+    "outcome": "success or partial or blocked or ongoing",
+    "keyItems": 3
+  }
 }
 
-CRITICAL CATEGORIZATION RULES:
-1. PRODUCT DISCUSSIONS = System Breakdown or Ideas (NOT Work Log)
-   - "NextBid is for services, NextBidder is for goods" = System Breakdown
-   - "We could add gamification to get users to enter data" = Ideas
-   - "I want to build a flywheel effect" = System Breakdown or Ideas
+## QUALITY RULES
 
-2. BUSINESS/ARCHITECTURE explanations are HIGH VALUE - extract them fully
-   - How products connect to each other
-   - Why systems are designed a certain way
-   - User flows, data flows, business logic
-
-3. Work Log is for TECHNICAL TASKS only:
-   - "Fixed the bug in line 42"
-   - "Updated the database schema"
-   - "Ran npm install"
-
-4. Tag WHICH PRODUCT is being discussed in the "products" array
-5. THE FORGE FALLBACK - When you cannot clearly categorize a topic:   - If it is a vague idea, concept, or brainstorm - use "Ideas" bucket   - Add "forge" to the keywords array   - These go to The Forge where ideas are heated, shaped, discarded, reforged   - Better to capture vaguely than to miss potential value   - Examples: random app ideas, game concepts, half-baked thoughts, feature experiments
-
-5. If someone explains how a product works, that's System Breakdown with confidence 0.9+
-
-RULES:
-- Only extract MEANINGFUL items, skip noise/garbage
-- Each item gets exactly ONE bucket from the list above
-- Use high confidence (0.8+) when clear, lower when uncertain
-- Extract product names in the products array when relevant
-- If no meaningful content, return {"items": [], "sessionSummary": null, "newKeywords": []}`;
+1. FEWER is BETTER - 5 quality items beats 50 fragments
+2. Each item must be SELF-CONTAINED - understandable on its own
+3. NO fragments - if you cannot synthesize a complete thought, skip it
+4. DEDUPLICATE - same topic = one item
+5. If unsure, DO NOT extract - quality over quantity
+6. If no meaningful content, return {"items": [], "detectedProject": null, "sessionSummary": null}`;
 }
 
 /**
@@ -209,10 +233,13 @@ async function callOpenAI(prompt) {
     body: JSON.stringify({
       model: config.OPENAI_MODEL || 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'You are Jen, an AI that extracts and categorizes development session content. You have deep knowledge of the NextBid product family. Always respond with valid JSON only.' },
+        {
+          role: 'system',
+          content: 'You are Jen, an AI that extracts COMPLETE, SYNTHESIZED items from conversations. You NEVER extract fragments. You understand the full context and create items that stand on their own. Quality over quantity. Always respond with valid JSON only.'
+        },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.3,
+      temperature: 0.2,
       max_tokens: 4000
     })
   });
@@ -233,81 +260,35 @@ function parseJsonSafe(response) {
   if (!response) return null;
 
   try {
-    // Try direct parse first
     return JSON.parse(response);
   } catch (e) {
-    logger.debug('Direct parse failed, trying cleanup', { error: e.message });
+    logger.debug('Direct parse failed, trying cleanup');
   }
 
-  // Try to extract JSON from markdown code blocks
+  // Try markdown code block
   const jsonMatch = response.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (jsonMatch) {
     try {
       return JSON.parse(jsonMatch[1].trim());
-    } catch (e) {
-      logger.debug('Markdown JSON parse failed', { error: e.message });
-    }
+    } catch (e) {}
   }
 
-  // Try to find JSON object in response
+  // Try to find JSON object
   const objectMatch = response.match(/\{[\s\S]*\}/);
   if (objectMatch) {
     try {
       return JSON.parse(objectMatch[0]);
-    } catch (e) {
-      logger.debug('Object extraction failed', { error: e.message });
-    }
+    } catch (e) {}
   }
 
   return null;
-}
-
-/**
- * Clean JSON response (remove trailing commas, etc.)
- */
-function cleanJsonResponse(str) {
-  return str
-    .replace(/,\s*}/g, '}')
-    .replace(/,\s*]/g, ']')
-    .replace(/[\x00-\x1F\x7F]/g, ' ')
-    .trim();
-}
-
-/**
- * Detect which products are mentioned in text
- */
-function detectProducts(text) {
-  const mentioned = [];
-  const textLower = text.toLowerCase();
-
-  for (const [product, info] of Object.entries(PRODUCT_FAMILY)) {
-    for (const keyword of info.keywords) {
-      if (textLower.includes(keyword.toLowerCase())) {
-        if (!mentioned.includes(product)) {
-          mentioned.push(product);
-        }
-        break;
-      }
-    }
-  }
-
-  return mentioned;
 }
 
 module.exports = {
   extract,
   buildExtractionPrompt,
   parseJsonSafe,
-  cleanJsonResponse,
-  detectProducts,
   BUCKETS,
-  PRODUCT_FAMILY
+  STRUCTURE_BUCKETS,
+  SUBSTANCE_BUCKETS
 };
-
-// Potential new project keywords - for brainstorming capture
-const NEW_PROJECT_SIGNALS = [
-  'app idea', 'new project', 'thinking about building', 'could build',
-  'potential app', 'side project', 'another company', 'new client',
-  'travel app', 'finance app', 'i have planned', 'want to build',
-  'brainstorm', 'what if we', 'could create', 'might build'
-];
