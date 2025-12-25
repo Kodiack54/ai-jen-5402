@@ -17,6 +17,7 @@ const config = require('../lib/config');
 const smartExtractor = require('./smartExtractor');
 const smartPatterns = require('./smartPatterns');
 
+const { extractFilePathsFromContent, detectProjectFromContentPaths } = require('./contentProjectDetector');
 const logger = new Logger('Jen:Processor');
 
 // 20 buckets → destination tables
@@ -152,8 +153,25 @@ async function processSession(session) {
       .join('\n\n');
   }
 
-  // Limit to 50k chars for AI
-  conversationText = conversationText.slice(0, 50000);
+  // v3.6: Content-based project detection from file paths BEFORE slicing
+  const rawContent = session.raw_content || conversationText;
+  const contentForPaths = rawContent.length > 200000 ? rawContent.slice(-150000) : rawContent;
+
+  // Limit to 50k chars for AI (after path extraction)
+  // For long sessions (>100k), use LAST 50k chars to get recent work
+  if (conversationText.length > 100000) {
+    conversationText = conversationText.slice(-50000);
+  } else {
+    conversationText = conversationText.slice(0, 50000);
+  }
+  const contentPaths = extractFilePathsFromContent(contentForPaths);
+  const contentProjectId = await detectProjectFromContentPaths(contentPaths, session.project_id, db, projectPathCache, logger);
+  if (contentProjectId) {
+    logger.info('Reassigning session to content-detected project', { sessionId: session.id, from: session.project_id, to: contentProjectId });
+    await db.from('dev_ai_sessions').update({ project_id: contentProjectId }).eq('id', session.id);
+    session.project_id = contentProjectId;
+  }
+
 
   // Detect project from session path FIRST
   const projectUuids = detectProjectFromPath(session.project_id);
@@ -233,6 +251,13 @@ function detectProjectFromPath(pathOrCwd) {
   const result = { client_id: null, parent_id: null, project_id: null };
 
   if (!pathOrCwd) return result;
+
+  // v3.6 FIX: If input is already a UUID, use it directly
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRegex.test(pathOrCwd)) {
+    result.project_id = pathOrCwd;
+    return result;
+  }
 
   // Normalize path
   const path = pathOrCwd.toLowerCase().replace(/\\/g, '/');
