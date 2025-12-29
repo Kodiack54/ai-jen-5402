@@ -8,7 +8,7 @@ const express = require('express');
 const cors = require('cors');
 const { Logger } = require('./lib/logger');
 const config = require('./lib/config');
-const processor = require('./services/processor');
+const processor = require('./services/processor-v5');
 const healthRoutes = require('./routes/health');
 const bucketsRoutes = require('./routes/buckets');
 
@@ -22,8 +22,8 @@ app.use('/', healthRoutes);
 app.use('/', bucketsRoutes);
 
 // Processing intervals
-const QUICK_PROCESS_INTERVAL = 10 * 1000;      // 30 seconds - pattern matching
-const SMART_PROCESS_INTERVAL = 2 * 60 * 1000;  // 5 minutes - AI extraction
+const QUICK_PROCESS_INTERVAL = 30 * 60 * 1000;  // 30 minutes      // 30 seconds - pattern matching
+const SMART_PROCESS_INTERVAL = 30 * 60 * 1000;  // 30 minutes  // 5 minutes - AI extraction
 const BATCH_SIZE = 50;
 
 let isProcessing = false;

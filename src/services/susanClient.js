@@ -23,7 +23,7 @@ async function sendQuickPatterns(sessionId, projectPath, patterns) {
         projectPath,
         quickData: patterns,
         parsedAt: new Date().toISOString(),
-        source: 'jen-5407'
+        source: 'jen-5402'
       })
     });
 
@@ -52,7 +52,7 @@ async function sendExtraction(sessionId, projectPath, extraction) {
         projectPath,
         extraction,
         catalogedAt: new Date().toISOString(),
-        source: 'jen-5407'
+        source: 'jen-5402'
       })
     });
 
@@ -86,7 +86,7 @@ async function sendTodo(projectPath, todo) {
         title: todo.title,
         description: todo.description,
         priority: todo.priority || 'medium',
-        source: 'jen-5407'
+        source: 'jen-5402'
       })
     });
 
@@ -115,7 +115,7 @@ async function sendKnowledge(projectPath, knowledge) {
         summary: knowledge.summary,
         category: knowledge.category || 'general',
         importance: 7,
-        source: 'jen-5407'
+        source: 'jen-5402'
       })
     });
 

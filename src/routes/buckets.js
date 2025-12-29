@@ -1,68 +1,77 @@
 /**
- * Buckets API - Returns counts for all flagged categories
+ * Buckets API - Returns counts for all bucket categories
  * Used by Session Hub to display real-time bucket counts
  */
 const express = require('express');
 const router = express.Router();
 const db = require('../lib/db');
 
-// Bucket category definitions
-const BUCKET_CATEGORIES = {
-  knowledge: ['Work Log', 'Ideas', 'Decisions', 'Lessons'],
-  docs: ['System Breakdown', 'How-To Guide', 'Schematic', 'Reference'],
-  conventions: ['Naming Conventions', 'File Structure', 'Database Patterns', 'API Patterns', 'Component Patterns', 'Quirks & Gotchas'],
-  bugs: ['Open', 'Fixed']
-};
-
 router.get('/api/buckets', async (req, res) => {
   try {
     const buckets = {};
 
-    // Knowledge categories
-    for (const cat of BUCKET_CATEGORIES.knowledge) {
+    // Knowledge - uses 'bucket' field
+    const knowledgeBuckets = ['Ideas', 'Quirks & Gotchas', 'Other'];
+    for (const bucket of knowledgeBuckets) {
       const { data } = await db.from('dev_ai_knowledge')
         .select('id')
-        .eq('category', cat);
-      buckets[cat] = data?.length || 0;
+        .eq('bucket', bucket);
+      buckets[bucket] = data?.length || 0;
     }
 
-    // Docs categories  
-    for (const cat of BUCKET_CATEGORIES.docs) {
+    // Docs - uses 'bucket' field  
+    const docBuckets = ['System Breakdown', 'How-To Guide', 'Schematic', 'Reference'];
+    for (const bucket of docBuckets) {
       const { data } = await db.from('dev_ai_docs')
         .select('id')
-        .eq('doc_type', cat);
-      buckets[cat] = data?.length || 0;
+        .eq('bucket', bucket);
+      buckets[bucket] = data?.length || 0;
     }
 
-    // Todos (total pending)
-    const { data: todos } = await db.from('dev_ai_todos')
-      .select('id')
-      .eq('status', 'pending');
-    buckets['Todos'] = todos?.length || 0;
-
-    // Conventions categories
-    for (const cat of BUCKET_CATEGORIES.conventions) {
+    // Conventions - uses 'bucket' field
+    const convBuckets = ['Naming Conventions', 'File Structure', 'Database Patterns', 'API Patterns', 'Component Patterns'];
+    for (const bucket of convBuckets) {
       const { data } = await db.from('dev_ai_conventions')
         .select('id')
-        .eq('category', cat);
-      buckets[cat] = data?.length || 0;
+        .eq('bucket', bucket);
+      buckets[bucket] = data?.length || 0;
     }
 
-    // Bug reports
+    // Todos - count by status
+    const { data: todos } = await db.from('dev_ai_todos')
+      .select('id')
+      .eq('status', 'flagged');
+    buckets['Todos'] = todos?.length || 0;
+
+    // Bugs - uses is_open flag
     const { data: openBugs } = await db.from('dev_ai_bugs')
       .select('id')
-      .eq('status', 'open');
+      .eq('is_open', true);
     buckets['Bugs Open'] = openBugs?.length || 0;
 
     const { data: fixedBugs } = await db.from('dev_ai_bugs')
       .select('id')
-      .eq('status', 'fixed');
+      .eq('is_open', false);
     buckets['Bugs Fixed'] = fixedBugs?.length || 0;
 
-    // Timeline/Journal
-    const { data: journal } = await db.from('dev_ai_journal')
+    // Journal - uses 'bucket' field
+    const journalBuckets = ['Journal', 'Work Log'];
+    for (const bucket of journalBuckets) {
+      const { data } = await db.from('dev_ai_journal')
+        .select('id')
+        .eq('bucket', bucket);
+      buckets[bucket] = data?.length || 0;
+    }
+
+    // Decisions
+    const { data: decisions } = await db.from('dev_ai_decisions')
       .select('id');
-    buckets['Journal'] = journal?.length || 0;
+    buckets['Decisions'] = decisions?.length || 0;
+
+    // Lessons
+    const { data: lessons } = await db.from('dev_ai_lessons')
+      .select('id');
+    buckets['Lessons'] = lessons?.length || 0;
 
     // Snippets
     const { data: snippets } = await db.from('dev_ai_snippets')

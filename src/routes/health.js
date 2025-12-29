@@ -10,7 +10,7 @@ router.get('/health', async (req, res) => {
     const dbOk = await db.ping();
     res.json({ 
       status: 'ok', 
-      service: 'jen-5407',
+      service: 'jen-5402',
       role: 'The Scrubber',
       database: dbOk ? 'connected' : 'disconnected'
     });
