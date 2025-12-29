@@ -62,11 +62,14 @@ async function initialize() {
 async function loadProjectCache() {
   try {
     const { data: projects } = await db.from('dev_projects')
-      .select('id, name, slug, parent_id, client_id');
+      .select('id, name, slug, parent_id, client_id, is_parent');
 
     if (projects) {
       projectPathCache = {};
       for (const p of projects) {
+        // Skip parent projects - they are containers, items should go to children
+        if (p.is_parent) continue;
+
         // Cache by slug and name variations
         const slug = (p.slug || '').toLowerCase();
         const name = (p.name || '').toLowerCase();
@@ -311,9 +314,18 @@ function deduplicateItems(items) {
   const seen = new Map();
 
   return items.filter(item => {
-    // Create a key from bucket + normalized title
-    const titleKey = (item.title || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 50);
-    const key = item.bucket + ':' + titleKey;
+    // For structure items (generic titles like "Directory Tree"), use content hash
+    // For substance items, use title
+    const isStructure = item.isStructure || ['Database Patterns', 'File Structure', 'API Patterns', 'Component Patterns', 'Naming Conventions', 'Snippets', 'Schematic'].includes(item.bucket);
+
+    let keyPart;
+    if (isStructure) {
+      // Use first 100 chars of content for structure items
+      keyPart = (item.content || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 100);
+    } else {
+      keyPart = (item.title || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 50);
+    }
+    const key = item.bucket + ':' + keyPart;
 
     if (seen.has(key)) {
       // If duplicate, keep the one with more content
