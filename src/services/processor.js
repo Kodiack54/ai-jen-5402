@@ -15,7 +15,7 @@ const { Logger } = require('../lib/logger');
 const db = require('../lib/db');
 const config = require('../lib/config');
 const smartExtractor = require('./smartExtractor');
-const smartPatterns = require('./smartPatterns');
+const structureExtractor = require('./structureExtractor');
 
 const { extractFilePathsFromContent, detectProjectFromContentPaths } = require('./contentProjectDetector');
 const logger = new Logger('Jen:Processor');
@@ -190,13 +190,10 @@ async function processSession(session) {
   let allItems = [];
 
   // 1. STRUCTURE items - literal pass-through (FREE)
-  const structureResult = smartPatterns.extract(
-    [{ content: conversationText }],
-    session.project_id
-  );
-  if (structureResult && structureResult.items) {
-    allItems.push(...structureResult.items);
-    logger.info('Structure items found', { count: structureResult.items.length });
+  const structureItems = structureExtractor.extract(conversationText, session.project_id);
+  if (structureItems && structureItems.length > 0) {
+    allItems.push(...structureItems);
+    logger.info('Structure items found', { count: structureItems.length });
   }
 
   // 2. SUBSTANCE items - contextual AI extraction
