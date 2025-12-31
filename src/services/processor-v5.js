@@ -660,9 +660,10 @@ async function extractStructure(content, sessionPath) {
 
   // File structure detection - Windows and Unix paths
   // STRICT: Must have proper path structure AND file extension
+  // Only project directories - NOT system paths
   const filePathPatterns = [
-    /[A-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]+\.\w{1,10}/gi,  // Windows: C:\path\file.ext
-    /\/(?:var|home|usr|www)\/\w+(?:\/[\w.-]+)+\.\w{1,10}/gi,            // Unix: /var/www/project/file.ext
+    /[A-Z]:\\Projects\\[\w.-]+(?:\\[\w.-]+)+\.\w{1,10}/gi,  // Windows: C:\Projects\...\file.ext
+    /\/var\/www\/[\w.-]+(?:\/[\w.-]+)+\.\w{1,10}/gi,        // Unix: /var/www/project/file.ext (projects only)
   ];
 
   const seenPaths = new Set();
@@ -672,6 +673,9 @@ async function extractStructure(content, sessionPath) {
       const normalized = filePath.toLowerCase().replace(/\\/g, '/');
       if (seenPaths.has(normalized)) continue;
       seenPaths.add(normalized);
+
+      // Skip system/garbage paths
+      if (/node_modules|__pycache__|\.git|\.next|dist\/|build\/|\.cache/.test(filePath)) continue;
 
       const fileName = filePath.split(/[\/\\]/).pop();
       const ext = fileName?.split('.').pop()?.toLowerCase();
@@ -689,13 +693,19 @@ async function extractStructure(content, sessionPath) {
       // Detect project from this specific path, fall back to session path
       const pathProject = await detectProjectFromPath(filePath) || projectInfo;
 
+      // SKIP if no project could be determined - don't create orphan entries
+      if (!pathProject?.project_id) {
+        logger.debug('Skipping structure item - no project detected', { path: filePath });
+        continue;
+      }
+
       items.push({
         bucket: 'File Structure',
         title: fileName,
         content: filePath,
         keywords: ['file', ext || 'unknown', fileName?.replace(/\.\w+$/, '') || 'file'],
-        project_id: pathProject?.project_id || null,
-        client_id: pathProject?.client_id || null
+        project_id: pathProject.project_id,
+        client_id: pathProject.client_id || null
       });
     }
   }
