@@ -8,7 +8,7 @@ const express = require('express');
 const cors = require('cors');
 const { Logger } = require('./lib/logger');
 const config = require('./lib/config');
-const processor = require('./services/processor-v5');
+const processor = require('./services/processor-v6');
 const healthRoutes = require('./routes/health');
 const bucketsRoutes = require('./routes/buckets');
 

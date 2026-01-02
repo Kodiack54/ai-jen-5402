@@ -1,0 +1,1020 @@
+/**
+ * Jen Processor v6.3 - PER-SESSION ROUTING + EVIDENCE TRACKING
+ *
+ * v6.3 FIXES:
+ * - Process each session independently (no more "first cwd wins")
+ * - extractCwdFromContent returns LAST cwd (most accurate)
+ * - project_id only used as UUID fallback, not as path
+ * - Claude prompt requires 2 context anchors for todos/bugs
+ * - All inserts include fingerprint_hash, evidence_excerpt, evidence_refs
+ * - Structure entries track operations (add/move/rename/remove)
+ */
+
+const { Logger } = require('../lib/logger');
+const db = require('../lib/db');
+const config = require('../lib/config');
+const Anthropic = require('@anthropic-ai/sdk');
+const crypto = require('crypto');
+
+const logger = new Logger('SuperJen:Processor');
+
+// Configuration
+const TIME_WINDOW_MS = 30 * 60 * 1000; // 30 minutes (for logging/budget only)
+const MAX_SESSION_CONTENT = 50000; // Max chars per session
+const DAILY_BUDGET_USD = 5.00;
+
+// v6.3: Window aggregation disabled by default
+const ENABLE_WINDOW_AGGREGATION = (typeof process !== 'undefined' && process.env && process.env.JEN_ENABLE_WINDOW_AGGREGATION === 'true');
+
+// Anthropic client
+let anthropic = null;
+function getClient() {
+  if (!anthropic) {
+    if (!config.ANTHROPIC_API_KEY) {
+      throw new Error('ANTHROPIC_API_KEY not configured');
+    }
+    anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+  }
+  return anthropic;
+}
+
+// Project caches
+let allProjects = [];
+let parentProjects = [];
+let projectLookup = {};
+let projectBySlug = {};
+let projectPaths = [];
+
+// 20 buckets -> destination tables
+const BUCKET_TO_TABLE = {
+  'Bugs Open': 'dev_ai_bugs',
+  'Bugs Fixed': 'dev_ai_bugs',
+  'Todos': 'dev_ai_todos',
+  'Journal': 'dev_ai_journal',
+  'Work Log': 'dev_ai_journal',
+  'Ideas': 'dev_ai_knowledge',
+  'Decisions': 'dev_ai_decisions',
+  'Lessons': 'dev_ai_lessons',
+  'System Breakdown': 'dev_ai_docs',
+  'How-To Guide': 'dev_ai_docs',
+  'Schematic': 'dev_ai_docs',
+  'Reference': 'dev_ai_docs',
+  'Naming Conventions': 'dev_ai_conventions',
+  'File Structure': 'dev_ai_conventions',
+  'Database Patterns': 'dev_ai_conventions',
+  'API Patterns': 'dev_ai_conventions',
+  'Component Patterns': 'dev_ai_conventions',
+  'Quirks & Gotchas': 'dev_ai_knowledge',
+  'Snippets': 'dev_ai_snippets',
+  'Other': 'dev_ai_knowledge'
+};
+
+// Auto-validated buckets (low-judgment passthrough)
+const AUTO_VALIDATE_BUCKETS = [
+  'Naming Conventions',
+  'File Structure',
+  'Database Patterns',
+  'API Patterns',
+  'Component Patterns'
+];
+
+// Status mapping
+function getStatusForBucket(bucket) {
+  const statusMap = {
+    'Bugs Open': 'open',
+    'Bugs Fixed': 'open',
+    'Todos': 'unassigned',
+    'Journal': 'pending',
+    'Work Log': 'pending',
+    'Ideas': 'pending',
+    'Decisions': 'pending',
+    'Lessons': 'pending',
+    'System Breakdown': 'pending',
+    'How-To Guide': 'pending',
+    'Schematic': 'pending',
+    'Reference': 'pending',
+    'Naming Conventions': 'active',
+    'File Structure': 'active',
+    'Database Patterns': 'active',
+    'API Patterns': 'active',
+    'Component Patterns': 'active',
+    'Quirks & Gotchas': 'pending',
+    'Snippets': 'pending',
+    'Other': 'pending'
+  };
+  return statusMap[bucket] || 'pending';
+}
+
+function getConventionType(bucket) {
+  const typeMap = {
+    'File Structure': 'structure',
+    'API Patterns': 'api',
+    'Database Patterns': 'database',
+    'Component Patterns': 'component',
+    'Naming Conventions': 'naming'
+  };
+  return typeMap[bucket] || 'other';
+}
+
+function getDocType(bucket) {
+  const typeMap = {
+    'System Breakdown': 'breakdown',
+    'How-To Guide': 'howto',
+    'Schematic': 'schematic',
+    'Reference': 'reference'
+  };
+  return typeMap[bucket] || 'reference';
+}
+
+
+/**
+ * Initialize - load all projects
+ */
+async function initialize() {
+  await loadProjects();
+  logger.info('Processor v6.3 initialized', {
+    totalProjects: allProjects.length,
+    parentProjects: parentProjects.length,
+    pathsLoaded: projectPaths.length,
+    windowAggregation: ENABLE_WINDOW_AGGREGATION,
+    mode: 'per-session-routing'
+  });
+  return true;
+}
+
+/**
+ * Load ALL projects for path matching
+ */
+async function loadProjects() {
+  try {
+    const { data: projects } = await db.from('dev_projects')
+      .select('id, name, slug, client_id, server_path, local_path, parent_id, is_parent, droplet_name, droplet_ip, port_dev')
+      .eq('is_active', true);
+
+    if (projects) {
+      allProjects = projects.map(p => ({
+        id: p.id,
+        name: p.name,
+        slug: p.slug,
+        client_id: p.client_id,
+        server_path: p.server_path,
+        local_path: p.local_path,
+        parent_id: p.parent_id,
+        is_parent: p.is_parent,
+        droplet_name: p.droplet_name,
+        droplet_ip: p.droplet_ip,
+        port_dev: p.port_dev
+      }));
+
+      parentProjects = allProjects.filter(p => !p.parent_id);
+      projectLookup = {};
+      projectBySlug = {};
+      projectPaths = [];
+
+      for (const p of allProjects) {
+        projectLookup[p.id] = p;
+        if (p.slug) projectBySlug[p.slug.toLowerCase()] = p;
+        if (p.name) projectBySlug[p.name.toLowerCase()] = p;
+
+        if (p.server_path) {
+          projectPaths.push({
+            path: p.server_path.toLowerCase().replace(/\\/g, '/'),
+            project: p,
+            type: 'server'
+          });
+        }
+        if (p.local_path) {
+          projectPaths.push({
+            path: p.local_path.toLowerCase().replace(/\\/g, '/'),
+            project: p,
+            type: 'local'
+          });
+        }
+      }
+
+      projectPaths.sort((a, b) => b.path.length - a.path.length);
+
+      logger.info('Loaded projects', {
+        total: allProjects.length,
+        parents: parentProjects.length,
+        paths: projectPaths.length
+      });
+    }
+  } catch (err) {
+    logger.error('Failed to load projects', { error: err.message });
+  }
+}
+
+function isWindowsPath(path) {
+  return /^[a-z]:/i.test(path) || path.includes('\\');
+}
+
+function extractPortFromFolderName(folderName) {
+  const portMatch = folderName.match(/(\d{4,5})$/);
+  return portMatch ? parseInt(portMatch[1], 10) : null;
+}
+
+function extractProjectFolder(path) {
+  if (!path) return null;
+
+  const isWindows = isWindowsPath(path);
+  const normalized = path.replace(/\\/g, '/');
+  const segments = normalized.split('/').filter(Boolean);
+  const projectParents = ['projects', 'studio', 'ai-team', 'premier_group', 'www', 'var'];
+
+  for (let i = 0; i < segments.length - 1; i++) {
+    const seg = segments[i].toLowerCase();
+    if (projectParents.includes(seg)) {
+      const projectFolder = segments[i + 1];
+      if (projectFolder && !projectFolder.startsWith('.') && projectFolder.length > 2) {
+        let fullPath;
+        if (isWindows) {
+          fullPath = segments.slice(0, i + 2).join('/');
+        } else {
+          fullPath = '/' + segments.slice(0, i + 2).join('/');
+        }
+        return { name: projectFolder, fullPath: fullPath };
+      }
+    }
+  }
+  return null;
+}
+
+function findParentByWalkingUp(normalizedPath) {
+  const segments = normalizedPath.split('/').filter(Boolean);
+
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const testPath = '/' + segments.slice(0, i + 1).join('/');
+
+    for (const { path: projectPath, project } of projectPaths) {
+      if (testPath === projectPath || testPath.endsWith(projectPath)) {
+        return { project, matchedPath: testPath };
+      }
+    }
+  }
+  return null;
+}
+
+
+/**
+ * Auto-create child project
+ */
+async function autoCreateProject(folderName, fullPath, parentProject) {
+  const slug = folderName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  const name = folderName.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+  if (!parentProject) {
+    logger.warn('Cannot auto-create project without parent', { folderName, fullPath });
+    return null;
+  }
+
+  const portDev = extractPortFromFolderName(folderName);
+  const isLocal = isWindowsPath(fullPath);
+  const normalizedPath = fullPath.replace(/\\/g, '/');
+
+  let serverPath = isLocal ? null : normalizedPath;
+  let localPath = isLocal ? normalizedPath : null;
+
+  if (isLocal && parentProject.server_path) {
+    serverPath = parentProject.server_path.replace(/\/$/, '') + '/' + folderName;
+  }
+
+  if (!serverPath) {
+    logger.warn('Cannot auto-create project without server_path', { folderName, fullPath });
+    return null;
+  }
+
+  try {
+    const { data, error } = await db.from('dev_projects').insert({
+      name: name,
+      slug: slug,
+      server_path: serverPath,
+      local_path: localPath,
+      parent_id: parentProject.id,
+      client_id: parentProject.client_id,
+      droplet_name: parentProject.droplet_name,
+      droplet_ip: parentProject.droplet_ip,
+      table_prefix: slug.replace(/-/g, '_') + '_',
+      port_dev: portDev,
+      is_parent: false,
+      is_active: true,
+      created_at: new Date().toISOString()
+    }).select('id, name, slug, client_id, server_path, local_path, parent_id, is_parent, droplet_name, droplet_ip, port_dev').single();
+
+    if (error) {
+      logger.warn('Failed to auto-create child project', { slug, error: error.message });
+      return null;
+    }
+
+    const project = {
+      id: data.id,
+      name: data.name,
+      slug: data.slug,
+      client_id: data.client_id,
+      server_path: data.server_path,
+      local_path: data.local_path,
+      parent_id: data.parent_id,
+      is_parent: data.is_parent,
+      droplet_name: data.droplet_name,
+      droplet_ip: data.droplet_ip,
+      port_dev: data.port_dev
+    };
+
+    allProjects.push(project);
+    projectLookup[project.id] = project;
+    projectBySlug[project.slug] = project;
+
+    projectPaths.push({
+      path: normalizedPath.toLowerCase(),
+      project: project,
+      type: isLocal ? 'local' : 'server'
+    });
+    projectPaths.sort((a, b) => b.path.length - a.path.length);
+
+    logger.info('Auto-created child project', {
+      name, slug, path: normalizedPath,
+      parentName: parentProject.name
+    });
+
+    return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+  } catch (err) {
+    logger.error('Auto-create project failed', { error: err.message });
+    return null;
+  }
+}
+
+/**
+ * Detect project from path - v6.3: Only use project_id as UUID, never as path
+ */
+async function detectProjectFromPath(path, sessionProjectId = null) {
+  if (!path) {
+    // v6.3: If no path but we have a valid UUID project_id, use it as fallback
+    if (sessionProjectId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionProjectId)) {
+      const project = projectLookup[sessionProjectId];
+      if (project && !project.is_parent) {
+        return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+      }
+    }
+    return {};
+  }
+
+  // If path is already UUID
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRegex.test(path)) {
+    const project = projectLookup[path];
+    if (project) {
+      return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+    }
+  }
+
+  const normalized = path.toLowerCase().replace(/\\/g, '/');
+
+  // 1. EXACT/CONTAINS MATCH against project paths
+  for (const { path: projectPath, project } of projectPaths) {
+    if (normalized.includes(projectPath)) {
+      if (project.is_parent) continue;
+      return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+    }
+  }
+
+  // 2. SLUG MATCH in path segments
+  const segments = normalized.split('/').filter(Boolean);
+  for (const seg of segments) {
+    if (projectBySlug[seg] && !projectBySlug[seg].is_parent) {
+      const project = projectBySlug[seg];
+      return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+    }
+
+    for (const [slug, project] of Object.entries(projectBySlug)) {
+      if ((slug.endsWith('-' + seg) || slug.endsWith('_' + seg)) && !project.is_parent) {
+        return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+      }
+      const slugWithoutPort = slug.replace(/^\d+-/, '');
+      if (slugWithoutPort === seg && !project.is_parent) {
+        return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+      }
+    }
+  }
+
+  // 3. AUTO-DISCOVERY
+  const folderInfo = extractProjectFolder(path);
+  if (folderInfo) {
+    const existingSlug = folderInfo.name.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    if (projectBySlug[existingSlug] && !projectBySlug[existingSlug].is_parent) {
+      const project = projectBySlug[existingSlug];
+      return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+    }
+
+    const parentResult = findParentByWalkingUp(normalized);
+    if (parentResult) {
+      return await autoCreateProject(folderInfo.name, folderInfo.fullPath, parentResult.project);
+    }
+  }
+
+  return {};
+}
+
+
+/**
+ * Log AI usage to database
+ */
+async function logUsage(model, inputTokens, outputTokens, durationMs, taskType = 'extraction') {
+  const costPerMillion = {
+    'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+    'claude-3-5-haiku-20241022': { input: 1.00, output: 5.00 }
+  };
+
+  const rates = costPerMillion[model] || costPerMillion['claude-3-haiku-20240307'];
+  const costUsd = (inputTokens * rates.input / 1000000) + (outputTokens * rates.output / 1000000);
+
+  try {
+    await db.from('dev_ai_usage').insert({
+      service: 'anthropic',
+      model,
+      task_type: taskType,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      cost_usd: costUsd,
+      duration_ms: durationMs,
+      success: true
+    });
+
+    return { costUsd, inputTokens, outputTokens };
+  } catch (err) {
+    logger.error('Failed to log usage', { error: err.message });
+    return { costUsd: 0 };
+  }
+}
+
+/**
+ * Check daily budget
+ */
+async function checkDailyBudget() {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const { data, error } = await db.from('dev_ai_usage')
+      .select('cost_usd')
+      .gte('created_at', today + 'T00:00:00Z')
+      .lt('created_at', today + 'T23:59:59Z');
+
+    if (error) throw error;
+
+    const totalSpent = (data || []).reduce((sum, r) => sum + parseFloat(r.cost_usd || 0), 0);
+    const remaining = DAILY_BUDGET_USD - totalSpent;
+
+    return {
+      spent: totalSpent,
+      remaining,
+      budget: DAILY_BUDGET_USD,
+      withinBudget: remaining > 0
+    };
+  } catch (err) {
+    logger.error('Failed to check budget', { error: err.message });
+    return { spent: 0, remaining: DAILY_BUDGET_USD, budget: DAILY_BUDGET_USD, withinBudget: true };
+  }
+}
+
+/**
+ * v6.3: Extract cwd - returns LAST cwd found (most accurate)
+ */
+function extractCwdFromContent(content) {
+  const cwdMatches = content.match(/"cwd"\s*:\s*"([^"]+)"/g);
+  if (cwdMatches && cwdMatches.length > 0) {
+    // Take the LAST cwd (where you ended up)
+    const lastMatch = cwdMatches[cwdMatches.length - 1];
+    const valueMatch = lastMatch.match(/"cwd"\s*:\s*"([^"]+)"/);
+    if (valueMatch) {
+      return valueMatch[1].replace(/\\\\/g, '/').replace(/\\/g, '/');
+    }
+  }
+  return null;
+}
+
+/**
+ * Generate fingerprint hash for deduplication
+ */
+function generateFingerprint(item) {
+  const content = `${item.bucket}:${item.title}:${(item.content || '').slice(0, 200)}`;
+  return crypto.createHash('md5').update(content).digest('hex').slice(0, 12);
+}
+
+/**
+ * Extract evidence excerpt from content
+ */
+function extractEvidenceExcerpt(content, maxLines = 3) {
+  if (!content) return null;
+  const lines = content.split('\n').filter(l => l.trim()).slice(0, maxLines);
+  return lines.join('\n').slice(0, 500);
+}
+
+
+/**
+ * Main entry point - v6.3: Process each session INDEPENDENTLY
+ */
+async function process(batchSize = 50) {
+  const budget = await checkDailyBudget();
+  logger.info('Budget check', {
+    spent: `$${budget.spent.toFixed(4)}`,
+    remaining: `$${budget.remaining.toFixed(4)}`,
+    budget: `$${budget.budget.toFixed(2)}`
+  });
+
+  if (!budget.withinBudget) {
+    logger.warn('Daily budget exceeded - skipping AI extraction', { spent: budget.spent });
+    return { processed: 0, errors: 0, items: 0, budgetExceeded: true };
+  }
+
+  let sessionsProcessed = 0;
+  let errors = 0;
+  let itemCount = 0;
+
+  try {
+    const { data: sessions, error } = await db.from('dev_ai_sessions')
+      .select('id, started_at, project_id, raw_content, source_type, source_name, project_slug, team_port')
+      .eq('status', 'active')
+      .order('started_at', { ascending: true })
+      .limit(batchSize);
+
+    if (error) throw error;
+    if (!sessions || sessions.length === 0) {
+      return { processed: 0, errors: 0, items: 0 };
+    }
+
+    logger.info('Processing sessions', {
+      count: sessions.length,
+      mode: 'per-session-routing'
+    });
+
+    // v6.3: Process each session INDEPENDENTLY (no window aggregation)
+    for (const session of sessions) {
+      const currentBudget = await checkDailyBudget();
+      if (!currentBudget.withinBudget) {
+        logger.warn('Budget limit reached mid-process');
+        break;
+      }
+
+      try {
+        const result = await processSingleSession(session);
+        if (result.success) {
+          sessionsProcessed++;
+          itemCount += result.items;
+        }
+      } catch (err) {
+        logger.error('Session failed', {
+          sessionId: session.id,
+          error: err.message
+        });
+        errors++;
+      }
+    }
+  } catch (err) {
+    logger.error('Process failed', { error: err.message });
+    errors++;
+  }
+
+  logger.info('Process complete', {
+    sessions: sessionsProcessed,
+    errors,
+    items: itemCount
+  });
+
+  return { processed: sessionsProcessed, errors, items: itemCount };
+}
+
+/**
+ * v6.3: Process a SINGLE session with its own routing
+ */
+async function processSingleSession(session) {
+  const content = session.raw_content || '';
+  
+  if (content.length < (config.MIN_CONTENT_LENGTH || 100)) {
+    await markSessionProcessed(session.id, 0);
+    return { success: false, items: 0, reason: 'content too short' };
+  }
+
+  // v6.3: Each session gets its OWN path detection
+  const sessionPath = extractCwdFromContent(content) || session.source_name || null;
+  
+  // v6.3: Pass session.project_id as UUID fallback only
+  const projectInfo = await detectProjectFromPath(sessionPath, session.project_id);
+
+  const truncatedContent = content.length > MAX_SESSION_CONTENT 
+    ? content.slice(-MAX_SESSION_CONTENT) 
+    : content;
+
+  logger.info('Processing session', {
+    sessionId: session.id,
+    source: session.source_name || session.source_type,
+    contentLen: content.length,
+    sessionPath,
+    projectId: projectInfo?.project_id || 'unknown'
+  });
+
+  const allItems = [];
+
+  // 1. Structure extraction (free - regex)
+  const structureItems = await extractStructure(truncatedContent, sessionPath, projectInfo);
+  allItems.push(...structureItems);
+
+  // 2. AI extraction
+  const smartItems = await extractWithClaude(truncatedContent, sessionPath, projectInfo, session);
+  allItems.push(...smartItems);
+
+  if (allItems.length === 0) {
+    await markSessionProcessed(session.id, 0);
+    return { success: true, items: 0 };
+  }
+
+  const uniqueItems = deduplicateItems(allItems);
+
+  let itemsWritten = 0;
+  for (const item of uniqueItems) {
+    const success = await writeItem(item, session);
+    if (success) itemsWritten++;
+  }
+
+  await markSessionProcessed(session.id, itemsWritten);
+
+  logger.info('Session complete', {
+    sessionId: session.id,
+    items: itemsWritten,
+    buckets: [...new Set(uniqueItems.map(i => i.bucket))]
+  });
+
+  return { success: true, items: itemsWritten };
+}
+
+
+/**
+ * Extract structure items (free - regex) - v6.3: Track operations
+ */
+async function extractStructure(content, sessionPath, projectInfo) {
+  const items = [];
+
+  // SQL Schema detection
+  const sqlMatches = content.match(/CREATE TABLE[\s\S]{10,500}?;/gi) || [];
+  const alterMatches = content.match(/ALTER TABLE[\s\S]{10,300}?;/gi) || [];
+
+  for (const sql of [...sqlMatches, ...alterMatches].slice(0, 5)) {
+    const tableMatch = sql.match(/(?:CREATE|ALTER) TABLE (?:IF NOT EXISTS )?["']?(\w+)["']?/i);
+    if (tableMatch) {
+      const isCreate = /CREATE TABLE/i.test(sql);
+      items.push({
+        bucket: 'Database Patterns',
+        title: `Schema: ${tableMatch[1]}`,
+        content: sql.trim(),
+        keywords: ['sql', 'schema', tableMatch[1].toLowerCase()],
+        isStructure: true,
+        operation: isCreate ? 'add' : 'modify',
+        ...projectInfo
+      });
+    }
+  }
+
+  // API endpoint detection
+  const apiPatterns = [
+    /(?:GET|POST|PUT|PATCH|DELETE)\s+[\/][\w\-\/\{\}:]+/gi,
+    /router\.(get|post|put|patch|delete)\s*\(['"][\w\-\/\{\}:]+['"]/gi,
+    /app\.(get|post|put|patch|delete)\s*\(['"][\w\-\/\{\}:]+['"]/gi
+  ];
+
+  for (const pattern of apiPatterns) {
+    const matches = content.match(pattern) || [];
+    for (const match of matches.slice(0, 10)) {
+      const endpoint = match.replace(/router\.|app\.|['"\(\)]/g, '');
+      if (endpoint.length > 3) {
+        items.push({
+          bucket: 'API Patterns',
+          title: `Endpoint: ${endpoint.slice(0, 50)}`,
+          content: match,
+          keywords: ['api', 'endpoint', 'route'],
+          isStructure: true,
+          operation: 'add',
+          ...projectInfo
+        });
+      }
+    }
+  }
+
+  // FILE PATH DETECTION
+  const filePathPatterns = [
+    /[A-Z]:\\\\(?:[^\\/:*?"<>|\r\n]+\\\\)*[^\\/:*?"<>|\r\n]+\.\w{1,10}/gi,
+    /[A-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]+\.\w{1,10}/gi,
+    /\/(?:var|home|usr|www)\/[\w.-]+(?:\/[\w.-]+)+\.\w{1,10}/gi,
+    /src\/[^\s'"`,;)}\]]+\.\w{2,6}/gi,
+  ];
+
+  const validExts = ['js', 'ts', 'tsx', 'jsx', 'py', 'json', 'md', 'sql', 'sh', 'css', 'html', 'vue', 'go', 'rs', 'java', 'php', 'rb', 'yml', 'yaml', 'env', 'config'];
+  const skipExts = ['log', 'tmp', 'cache', 'lock', 'map', 'svg', 'png', 'jpg', 'gif', 'ico', 'woff', 'ttf'];
+  const skipPaths = ["/usr/lib/", "/usr/share/", "/var/run/", "/var/log/", "/root/.pm2/", "node_modules/", ".s.PGSQL"];
+  const treeChars = /[└├│─┌┐┘┤┬┴┼]/;
+
+  const seenPaths = new Set();
+
+  for (const pattern of filePathPatterns) {
+    const matches = content.match(pattern) || [];
+    for (let rawPath of matches) {
+      const filePath = rawPath.replace(/\\\\/g, '/').replace(/\\/g, '/');
+      const normalized = filePath.toLowerCase();
+      if (seenPaths.has(normalized)) continue;
+      seenPaths.add(normalized);
+
+      const fileName = filePath.split('/').pop();
+      const ext = fileName?.split('.').pop()?.toLowerCase();
+
+      if (skipExts.includes(ext)) continue;
+      if (!fileName || fileName.length < 3) continue;
+      if (!validExts.includes(ext)) continue;
+      if (skipPaths.some(sp => normalized.includes(sp.toLowerCase()))) continue;
+      if (treeChars.test(rawPath)) continue;
+
+      // v6.3: Detect operation from context
+      let operation = 'add';
+      const pathContext = content.slice(Math.max(0, content.indexOf(rawPath) - 100), content.indexOf(rawPath) + rawPath.length + 100);
+      if (/(?:delet|remov|rm |unlink)/i.test(pathContext)) operation = 'remove';
+      else if (/(?:renam|mv |move)/i.test(pathContext)) operation = 'rename';
+      else if (/(?:refactor|split|extract)/i.test(pathContext)) operation = 'split';
+
+      items.push({
+        bucket: 'File Structure',
+        convention_type: 'structure',
+        title: fileName,
+        content: filePath,
+        keywords: ['structure', ext, fileName?.replace(/\.[^.]+$/, '') || ''],
+        isStructure: true,
+        operation,
+        tree_path: filePath,
+        node_type: 'file',
+        ...projectInfo
+      });
+    }
+  }
+
+  return items;
+}
+
+
+/**
+ * Claude AI extraction - v6.3: Requires 2 context anchors for todos/bugs
+ */
+async function extractWithClaude(content, sessionPath, projectInfo, session) {
+  const client = getClient();
+
+  // v6.3: Tightened prompt requiring 2 context anchors
+  const systemPrompt = `You extract development items from coding sessions.
+
+CRITICAL RULES:
+1. ONLY extract what is EXPLICITLY discussed. Do NOT hallucinate.
+2. For Todos and Bugs, you MUST include AT LEAST 2 of these context anchors:
+   - File path or module/component name
+   - Error message or log line
+   - Explicit reason ("because...", "blocking...", "needed for...")
+   - Location in app ("Project Management > Todos", "aiPhaseAssigner.js", etc.)
+   If you cannot provide 2 anchors, output as "Snippets" or skip entirely.
+
+BUCKETS:
+- Bugs Open: Real unresolved errors. MUST include: error message + file path.
+- Bugs Fixed: Bugs that were solved. MUST include: what broke + the fix.
+- Todos: Real tasks. MUST include: what + where OR what + why.
+- Work Log: What was worked on - files changed, features built.
+- Ideas: Feature ideas with explanation.
+- Decisions: Technical choices with reasoning.
+- Lessons: Insights or gotchas discovered.
+- Snippets: Code fragments without enough context for todos/bugs.
+
+Return JSON array:
+[{"bucket": "Todos", "title": "Clear title", "content": "Full details with file paths and reasons - 2-5 sentences", "keywords": ["real", "tags"], "evidence_lines": ["actual line from session"]}]
+
+Quality over quantity. If unsure, use Snippets or skip. Empty sessions return: []`;
+
+  const startTime = Date.now();
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-3-haiku-20240307',
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages: [{
+        role: 'user',
+        content: `Extract development items from this coding session:\n\n${content.slice(0, 45000)}`
+      }]
+    });
+
+    const durationMs = Date.now() - startTime;
+
+    if (response.usage) {
+      await logUsage(
+        'claude-3-haiku-20240307',
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+        durationMs
+      );
+    }
+
+    const text = response.content[0]?.text || '';
+
+    let items = [];
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      try {
+        items = JSON.parse(jsonMatch[0]);
+      } catch (e) {
+        logger.warn('JSON parse failed', { error: e.message });
+      }
+    }
+
+    // Add project info and evidence to items
+    return items.map(item => ({
+      ...item,
+      ...projectInfo,
+      isStructure: false,
+      evidence_lines: item.evidence_lines || []
+    }));
+
+  } catch (err) {
+    logger.error('Claude extraction failed', { error: err.message });
+    await logUsage('claude-3-haiku-20240307', 0, 0, Date.now() - startTime);
+    return [];
+  }
+}
+
+/**
+ * Deduplicate items
+ */
+function deduplicateItems(items) {
+  const seen = new Map();
+
+  return items.filter(item => {
+    const key = item.bucket + ':' + (item.title || '').toLowerCase().slice(0, 50);
+
+    if (seen.has(key)) {
+      const existing = seen.get(key);
+      if ((item.content || '').length > (existing.content || '').length) {
+        seen.set(key, item);
+      }
+      return false;
+    }
+
+    seen.set(key, item);
+    return true;
+  });
+}
+
+
+/**
+ * Write item to destination table - v6.3: Full metadata with evidence
+ */
+async function writeItem(item, session) {
+  const table = BUCKET_TO_TABLE[item.bucket] || 'dev_ai_knowledge';
+  const isAutoValidate = AUTO_VALIDATE_BUCKETS.includes(item.bucket);
+  
+  // v6.3: Build comprehensive metadata
+  const metadata = {
+    origin_worker: '02-Jen',
+    requires_review: !isAutoValidate,
+    extracted_at: new Date().toISOString(),
+    fingerprint_hash: generateFingerprint(item),
+    evidence_excerpt: extractEvidenceExcerpt(item.content),
+    evidence_refs: {
+      source_session_id: session.id,
+      source_name: session.source_name || session.source_type,
+      cwd: extractCwdFromContent(session.raw_content || ''),
+      file_path: item.tree_path || null
+    },
+    project_slug: session.project_slug || null,
+    team_port: session.team_port || null
+  };
+  
+  // For structure entries, add operation tracking
+  if (item.isStructure) {
+    metadata.operation = item.operation || 'add';
+    metadata.tree_path = item.tree_path || null;
+    metadata.node_type = item.node_type || 'file';
+    if (item.previous_path) {
+      metadata.previous_path = item.previous_path;
+    }
+  }
+  
+  // For Bugs Fixed, add completion signal
+  if (item.bucket === 'Bugs Fixed') {
+    metadata.completion_signal = 'fixed_mentioned';
+  }
+  
+  // Add evidence lines if provided by Claude
+  if (item.evidence_lines && item.evidence_lines.length > 0) {
+    metadata.evidence_lines = item.evidence_lines.slice(0, 5);
+  }
+
+  const baseRecord = {
+    client_id: item.client_id || null,
+    parent_id: item.parent_id || null,
+    project_id: item.project_id || null,
+    bucket: item.bucket,
+    keywords: JSON.stringify(item.keywords || []),
+    source_session_id: session.id,
+    status: getStatusForBucket(item.bucket),
+    created_at: new Date().toISOString(),
+    metadata: metadata,
+    validated_at: isAutoValidate ? new Date().toISOString() : null
+  };
+
+  try {
+    if (table === 'dev_ai_todos') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    } else if (table === 'dev_ai_bugs') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title,
+        severity: 'medium'
+      });
+    } else if (table === 'dev_ai_knowledge') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        category: item.bucket
+      });
+    } else if (table === 'dev_ai_docs') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        doc_type: getDocType(item.bucket)
+      });
+    } else if (table === 'dev_ai_conventions') {
+      await db.from(table).insert({
+        ...baseRecord,
+        name: (item.title || '').substring(0, 200),
+        description: item.content || item.title,
+        convention_type: getConventionType(item.bucket)
+      });
+    } else if (table === 'dev_ai_decisions') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    } else if (table === 'dev_ai_lessons') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        the_problem: item.content || item.title,
+        description: item.content || item.title,
+        what_was_tried: item.what_was_tried || item.content || item.title
+      });
+    } else if (table === 'dev_ai_journal') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        entry_type: item.bucket === 'Work Log' ? 'work_log' : 'journal'
+      });
+    } else if (table === 'dev_ai_snippets') {
+      await db.from(table).insert({
+        ...baseRecord,
+        content: item.content || item.title,
+        snippet_type: 'extracted'
+      });
+    }
+
+    return true;
+  } catch (err) {
+    logger.error('Failed to write item', { table, bucket: item.bucket, error: err.message });
+    return false;
+  }
+}
+
+/**
+ * Mark session as processed
+ */
+async function markSessionProcessed(sessionId, itemCount) {
+  try {
+    await db.from('dev_ai_sessions')
+      .update({
+        status: 'processed',
+        processed_at: new Date().toISOString(),
+        items_extracted: itemCount
+      })
+      .eq('id', sessionId);
+  } catch (err) {
+    logger.error('Failed to mark processed', { error: err.message });
+  }
+}
+
+// Exports
+const quickProcess = () => process(10);
+const smartProcess = () => process(50);
+
+module.exports = {
+  initialize,
+  process,
+  quickProcess,
+  smartProcess,
+  checkDailyBudget
+};

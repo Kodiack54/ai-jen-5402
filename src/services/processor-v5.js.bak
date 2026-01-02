@@ -1,0 +1,561 @@
+/**
+ * SuperJen Processor v5.0 - Claude AI with Guardrails
+ *
+ * ARCHITECTURE:
+ * 1. Get active sessions from dev_ai_sessions
+ * 2. Run structureExtractor for PASS-THROUGH items (free regex)
+ * 3. Run Claude AI for SMART extraction with strict guardrails
+ * 4. Write items to 9 destination tables with status='flagged'
+ * 5. Mark session as processed
+ *
+ * QUALITY > QUANTITY - Only extract actionable, specific content
+ */
+
+const Anthropic = require('@anthropic-ai/sdk');
+const { Logger } = require('../lib/logger');
+const db = require('../lib/db');
+const config = require('../lib/config');
+
+const logger = new Logger('SuperJen:Processor');
+
+// Claude client
+let anthropic = null;
+
+function getClient() {
+  if (!anthropic) {
+    if (!config.ANTHROPIC_API_KEY) {
+      throw new Error('ANTHROPIC_API_KEY not configured');
+    }
+    anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+    logger.info('Claude client initialized');
+  }
+  return anthropic;
+}
+
+// 20 buckets → 9 destination tables
+const BUCKET_TO_TABLE = {
+  'Bugs Open': 'dev_ai_bugs',
+  'Bugs Fixed': 'dev_ai_bugs',
+  'Todos': 'dev_ai_todos',
+  'Journal': 'dev_ai_journal',
+  'Work Log': 'dev_ai_journal',
+  'Ideas': 'dev_ai_knowledge',
+  'Decisions': 'dev_ai_decisions',
+  'Lessons': 'dev_ai_lessons',
+  'System Breakdown': 'dev_ai_docs',
+  'How-To Guide': 'dev_ai_docs',
+  'Schematic': 'dev_ai_docs',
+  'Reference': 'dev_ai_docs',
+  'Naming Conventions': 'dev_ai_conventions',
+  'File Structure': 'dev_ai_conventions',
+  'Database Patterns': 'dev_ai_conventions',
+  'API Patterns': 'dev_ai_conventions',
+  'Component Patterns': 'dev_ai_conventions',
+  'Quirks & Gotchas': 'dev_ai_knowledge',
+  'Snippets': 'dev_ai_snippets',
+  'Other': 'dev_ai_knowledge'
+};
+
+// Project path → UUID cache
+let projectCache = {};
+
+/**
+ * Initialize - load project cache
+ */
+async function initialize() {
+  await loadProjectCache();
+  logger.info('SuperJen initialized', { projects: Object.keys(projectCache).length });
+  return true;
+}
+
+/**
+ * Load project slugs for path matching
+ */
+async function loadProjectCache() {
+  try {
+    const { data: projects } = await db.from('dev_projects')
+      .select('id, name, slug, parent_id, client_id');
+
+    if (projects) {
+      projectCache = {};
+      for (const p of projects) {
+        const slug = (p.slug || '').toLowerCase();
+        const name = (p.name || '').toLowerCase();
+        if (slug) projectCache[slug] = p;
+        if (name) projectCache[name] = p;
+        // Also cache without port numbers
+        const slugNoPort = slug.replace(/-\d{4}$/, '');
+        if (slugNoPort !== slug) projectCache[slugNoPort] = p;
+      }
+    }
+  } catch (err) {
+    logger.error('Failed to load project cache', { error: err.message });
+  }
+}
+
+/**
+ * Main entry point - process active sessions
+ */
+async function process(batchSize = 20) {
+  let processed = 0;
+  let errors = 0;
+  let itemCount = 0;
+
+  try {
+    const { data: sessions, error } = await db.from('dev_ai_sessions')
+      .select('id, started_at, project_id, raw_content')
+      .eq('status', 'active')
+      .order('started_at', { ascending: true })
+      .limit(batchSize);
+
+    if (error) throw error;
+    if (!sessions || sessions.length === 0) {
+      return { processed: 0, errors: 0, items: 0 };
+    }
+
+    logger.info('Processing sessions', { count: sessions.length });
+
+    for (const session of sessions) {
+      try {
+        const result = await processSession(session);
+        if (result.success) {
+          processed++;
+          itemCount += result.items;
+        }
+      } catch (err) {
+        logger.error('Session failed', { id: session.id, error: err.message });
+        errors++;
+      }
+    }
+  } catch (err) {
+    logger.error('Process batch failed', { error: err.message });
+    errors++;
+  }
+
+  logger.info('Process complete', { processed, errors, items: itemCount });
+  return { processed, errors, items: itemCount };
+}
+
+/**
+ * Process a single session
+ */
+async function processSession(session) {
+  let content = session.raw_content || '';
+
+  // Skip if content too short
+  if (content.length < config.MIN_CONTENT_LENGTH) {
+    await markSessionProcessed(session.id, 0);
+    return { success: false, items: 0, reason: 'content too short' };
+  }
+
+  // For AI extraction, use last 50k chars (recent work, not old beginning)
+  if (content.length > 100000) {
+    content = content.slice(-50000);
+  } else if (content.length > 50000) {
+    content = content.slice(0, 50000);
+  }
+
+  // Detect project from session path
+  const projectInfo = detectProjectFromPath(session.project_id);
+
+  logger.info('Processing session', {
+    id: session.id,
+    path: session.project_id,
+    project: projectInfo.project_id ? 'found' : 'null',
+    contentLen: content.length
+  });
+
+  // Collect all items
+  const allItems = [];
+
+  // 1. PASS-THROUGH: Structure extraction (free - regex)
+  const structureItems = extractStructure(content);
+  allItems.push(...structureItems);
+
+  if (structureItems.length > 0) {
+    logger.info('Structure items', { count: structureItems.length });
+  }
+
+  // 2. SMART: Claude AI extraction with guardrails
+  const smartItems = await extractWithClaude(content, session.project_id);
+  allItems.push(...smartItems);
+
+  if (smartItems.length > 0) {
+    logger.info('Smart items', { count: smartItems.length });
+  }
+
+  if (allItems.length === 0) {
+    await markSessionProcessed(session.id, 0);
+    return { success: true, items: 0 };
+  }
+
+  // Deduplicate by title similarity
+  const uniqueItems = deduplicateItems(allItems);
+
+  // Write items to destination tables
+  let itemsWritten = 0;
+  for (const item of uniqueItems) {
+    const success = await writeItem(item, session.id, projectInfo);
+    if (success) itemsWritten++;
+  }
+
+  await markSessionProcessed(session.id, itemsWritten);
+
+  logger.info('Session complete', {
+    id: session.id,
+    items: itemsWritten,
+    buckets: [...new Set(uniqueItems.map(i => i.bucket))]
+  });
+
+  return { success: true, items: itemsWritten };
+}
+
+/**
+ * PASS-THROUGH: Extract structure items (SQL schemas, API endpoints, file paths)
+ */
+function extractStructure(content) {
+  const items = [];
+
+  // SQL Schema detection
+  const sqlMatches = content.match(/CREATE TABLE[\s\S]{10,500}?;/gi) || [];
+  const alterMatches = content.match(/ALTER TABLE[\s\S]{10,300}?;/gi) || [];
+
+  for (const sql of [...sqlMatches, ...alterMatches]) {
+    const tableMatch = sql.match(/(?:CREATE|ALTER) TABLE (?:IF NOT EXISTS )?["']?(\w+)["']?/i);
+    if (tableMatch) {
+      items.push({
+        bucket: 'Database Patterns',
+        title: `Schema: ${tableMatch[1]}`,
+        content: sql.trim(),
+        keywords: ['sql', 'schema', tableMatch[1].toLowerCase()]
+      });
+    }
+  }
+
+  // API Endpoint detection
+  const apiPatterns = [
+    /(?:GET|POST|PUT|PATCH|DELETE)\s+[\/][\w\-\/\{\}:]+/gi,
+    /router\.(get|post|put|patch|delete)\s*\(['"][\w\-\/\{\}:]+['"]\)/gi,
+    /app\.(get|post|put|patch|delete)\s*\(['"][\w\-\/\{\}:]+['"]\)/gi
+  ];
+
+  for (const pattern of apiPatterns) {
+    const matches = content.match(pattern) || [];
+    for (const match of matches) {
+      const endpoint = match.replace(/router\.|app\.|['"\(\)]/g, '');
+      if (endpoint.length > 3) {
+        items.push({
+          bucket: 'API Patterns',
+          title: `Endpoint: ${endpoint.slice(0, 50)}`,
+          content: match,
+          keywords: ['api', 'endpoint', 'route']
+        });
+      }
+    }
+  }
+
+  return items;
+}
+
+/**
+ * SMART: Claude AI extraction with strict guardrails
+ */
+async function extractWithClaude(content, projectPath) {
+  const client = getClient();
+
+  const systemPrompt = `You are SuperJen, an expert at extracting actionable development items from coding sessions.
+
+STRICT GUARDRAILS - QUALITY OVER QUANTITY:
+1. Only extract items with SPECIFIC, ACTIONABLE content
+2. IGNORE vague statements like "worked on X" or "fixed something" or "continue development"
+3. Each todo must describe WHAT needs to be done specifically
+4. Each bug must describe the SPECIFIC issue and WHERE it occurs
+5. Documentation must have enough context to be useful standalone
+6. If unsure, DO NOT extract - quality over quantity
+7. Maximum 10 items per session - only the most important ones
+
+EXAMPLES OF BAD (DO NOT EXTRACT):
+- "Continue development on core platform"
+- "Fixed a bug"
+- "Working on the feature"
+- "Had some issues"
+- "Made progress on X"
+
+EXAMPLES OF GOOD (DO EXTRACT):
+- Todos: "Add email validation to user registration form"
+- Bugs Open: "App crashes when uploading photos > 5MB in ProfilePicture component"
+- Bugs Fixed: "Fixed null pointer in getUserById when user doesn't exist"
+- Ideas: "Could use Redis for session caching to reduce DB load"
+- Decisions: "Going with PostgreSQL over MongoDB for ACID compliance"
+- Lessons: "Always use optional chaining (?.) when accessing nested properties"
+- Work Log: "Implemented JWT refresh token flow with 7-day expiry"
+
+Respond ONLY with valid JSON array. Each item must have:
+- bucket: One of [Todos, Bugs Open, Bugs Fixed, Ideas, Decisions, Lessons, Work Log, Journal]
+- title: Short descriptive title (max 100 chars)
+- content: Full details with context
+- keywords: Array of 2-5 relevant keywords
+
+If no quality items found, return empty array: []`;
+
+  try {
+    const response = await client.messages.create({
+      model: config.CLAUDE_MODEL,
+      max_tokens: config.MAX_TOKENS,
+      system: systemPrompt,
+      messages: [
+        {
+          role: 'user',
+          content: `Extract actionable items from this coding session. Project: ${projectPath || 'Unknown'}
+
+Session content:
+${content}
+
+Remember: Quality over quantity. Only extract specific, actionable items. Return JSON array only.`
+        }
+      ]
+    });
+
+    const responseText = response.content[0].text;
+
+    // Parse JSON response
+    try {
+      // Handle markdown code blocks
+      let jsonText = responseText;
+      if (responseText.includes('```')) {
+        const match = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (match) jsonText = match[1];
+      }
+
+      const items = JSON.parse(jsonText.trim());
+
+      if (!Array.isArray(items)) {
+        logger.warn('Claude returned non-array', { response: responseText.slice(0, 200) });
+        return [];
+      }
+
+      // Validate and filter items
+      return items.filter(item => {
+        if (!item.bucket || !item.title) return false;
+        if (!BUCKET_TO_TABLE[item.bucket]) return false;
+        if (item.title.length < 10) return false;
+        // Filter out vague items
+        const vague = ['continue', 'working on', 'progress', 'stuff', 'things', 'some'];
+        if (vague.some(v => item.title.toLowerCase().includes(v))) return false;
+        return true;
+      }).slice(0, 10); // Max 10 items
+
+    } catch (parseErr) {
+      logger.error('JSON parse failed', { error: parseErr.message, response: responseText.slice(0, 500) });
+      return [];
+    }
+  } catch (err) {
+    logger.error('Claude extraction failed', { error: err.message });
+    return [];
+  }
+}
+
+/**
+ * Detect project UUID from path/cwd
+ */
+function detectProjectFromPath(pathOrCwd) {
+  const result = { client_id: null, parent_id: null, project_id: null };
+  if (!pathOrCwd) return result;
+
+  // If already a UUID, use directly
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRegex.test(pathOrCwd)) {
+    result.project_id = pathOrCwd;
+    return result;
+  }
+
+  // Normalize path and try matching
+  const path = pathOrCwd.toLowerCase().replace(/\\/g, '/');
+  const parts = path.split('/').filter(Boolean);
+
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i];
+
+    if (projectCache[part]) {
+      const p = projectCache[part];
+      result.project_id = p.id;
+      result.client_id = p.client_id;
+      result.parent_id = p.parent_id;
+      return result;
+    }
+
+    // Try without port
+    const noPort = part.replace(/-\d{4}$/, '');
+    if (projectCache[noPort]) {
+      const p = projectCache[noPort];
+      result.project_id = p.id;
+      result.client_id = p.client_id;
+      result.parent_id = p.parent_id;
+      return result;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Deduplicate items by title similarity
+ */
+function deduplicateItems(items) {
+  const seen = new Map();
+
+  return items.filter(item => {
+    const key = item.bucket + ':' + (item.title || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40);
+
+    if (seen.has(key)) {
+      const existing = seen.get(key);
+      if ((item.content || '').length > (existing.content || '').length) {
+        seen.set(key, item);
+      }
+      return false;
+    }
+
+    seen.set(key, item);
+    return true;
+  });
+}
+
+/**
+ * Write item to destination table
+ */
+async function writeItem(item, sessionId, uuids) {
+  const table = BUCKET_TO_TABLE[item.bucket] || 'dev_ai_knowledge';
+
+  const baseRecord = {
+    client_id: uuids.client_id,
+    parent_id: uuids.parent_id,
+    project_id: uuids.project_id,
+    bucket: item.bucket,
+    keywords: JSON.stringify(item.keywords || []),
+    source_session_id: sessionId,
+    status: 'flagged',
+    created_at: new Date().toISOString()
+  };
+
+  try {
+    if (table === 'dev_ai_todos') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    }
+    else if (table === 'dev_ai_bugs') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title,
+        severity: 'medium',
+        is_open: item.bucket === 'Bugs Open'
+      });
+    }
+    else if (table === 'dev_ai_knowledge') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        category: item.bucket
+      });
+    }
+    else if (table === 'dev_ai_docs') {
+      const docTypeMap = {
+        'System Breakdown': 'breakdown',
+        'How-To Guide': 'howto',
+        'Schematic': 'schematic',
+        'Reference': 'reference'
+      };
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        doc_type: docTypeMap[item.bucket] || 'reference'
+      });
+    }
+    else if (table === 'dev_ai_conventions') {
+      const convTypeMap = {
+        'Naming Conventions': 'naming',
+        'File Structure': 'structure',
+        'Database Patterns': 'database',
+        'API Patterns': 'api',
+        'Component Patterns': 'component'
+      };
+      await db.from(table).insert({
+        ...baseRecord,
+        name: (item.title || '').substring(0, 200),
+        description: item.content || item.title,
+        convention_type: convTypeMap[item.bucket] || 'other'
+      });
+    }
+    else if (table === 'dev_ai_snippets') {
+      await db.from(table).insert({
+        ...baseRecord,
+        content: item.content || item.title,
+        snippet_type: 'extracted'
+      });
+    }
+    else if (table === 'dev_ai_decisions') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    }
+    else if (table === 'dev_ai_lessons') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    }
+    else if (table === 'dev_ai_journal') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        entry_type: item.bucket === 'Work Log' ? 'work_log' : 'journal'
+      });
+    }
+
+    return true;
+  } catch (err) {
+    logger.error('Write failed', { table, bucket: item.bucket, error: err.message });
+    return false;
+  }
+}
+
+/**
+ * Mark session as processed
+ */
+async function markSessionProcessed(sessionId, itemCount) {
+  try {
+    await db.from('dev_ai_sessions')
+      .update({
+        status: 'processed',
+        processed_at: new Date().toISOString(),
+        items_extracted: itemCount
+      })
+      .eq('id', sessionId);
+  } catch (err) {
+    logger.error('Failed to mark processed', { error: err.message });
+  }
+}
+
+// Compatibility exports
+const quickProcess = () => process(10);
+const smartProcess = () => process(20);
+
+module.exports = {
+  initialize,
+  process,
+  quickProcess,
+  smartProcess,
+  detectProjectFromPath,
+  extractStructure,
+  extractWithClaude,
+  deduplicateItems
+};

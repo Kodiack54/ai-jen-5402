@@ -1,0 +1,1136 @@
+/**
+ * Jen Processor v6.1 - TIME WINDOW AGGREGATION + FULL PROJECT DETECTION
+ *
+ * KEY CHANGE: Instead of processing sessions individually,
+ * groups ALL sessions within a 30-min time window and makes ONE AI call
+ *
+ * v6.1 FIXES: Restored full project detection from v5 (was stripped in v6.0)
+ */
+
+const { Logger } = require('../lib/logger');
+const db = require('../lib/db');
+const config = require('../lib/config');
+const Anthropic = require('@anthropic-ai/sdk');
+const structureExtractor = require('./structureExtractor');
+
+const logger = new Logger('SuperJen:Processor');
+
+// Configuration
+const TIME_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_COMBINED_CONTENT = 100000; // Max chars for combined content
+const DAILY_BUDGET_USD = 5.00; // Daily budget limit
+
+// Anthropic client
+let anthropic = null;
+function getClient() {
+  if (!anthropic) {
+    if (!config.ANTHROPIC_API_KEY) {
+      throw new Error('ANTHROPIC_API_KEY not configured');
+    }
+    anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+  }
+  return anthropic;
+}
+
+// Project caches (RESTORED from v5)
+let allProjects = [];        // ALL projects (parents + children)
+let parentProjects = [];     // Only parents (for Claude prompt)
+let projectLookup = {};      // by UUID
+let projectBySlug = {};      // by slug
+let projectPaths = [];       // { path: string, project: object } sorted by path length desc
+
+// 20 buckets -> destination tables
+const BUCKET_TO_TABLE = {
+  'Bugs Open': 'dev_ai_bugs',
+  'Bugs Fixed': 'dev_ai_bugs',
+  'Todos': 'dev_ai_todos',
+  'Journal': 'dev_ai_journal',
+  'Work Log': 'dev_ai_journal',
+  'Ideas': 'dev_ai_knowledge',
+  'Decisions': 'dev_ai_decisions',
+  'Lessons': 'dev_ai_lessons',
+  'System Breakdown': 'dev_ai_docs',
+  'How-To Guide': 'dev_ai_docs',
+  'Schematic': 'dev_ai_docs',
+  'Reference': 'dev_ai_docs',
+  'Naming Conventions': 'dev_ai_conventions',
+  'File Structure': 'dev_ai_conventions',
+  'Database Patterns': 'dev_ai_conventions',
+  'API Patterns': 'dev_ai_conventions',
+  'Component Patterns': 'dev_ai_conventions',
+  'Quirks & Gotchas': 'dev_ai_knowledge',
+  'Snippets': 'dev_ai_snippets',
+  'Other': 'dev_ai_knowledge'
+};
+
+// Status mapping based on bucket
+function getStatusForBucket(bucket) {
+  const statusMap = {
+    'Bugs Open': 'open',
+    'Bugs Fixed': 'open',
+    'Todos': 'unassigned',
+    'Journal': 'pending',
+    'Work Log': 'pending',
+    'Ideas': 'pending',
+    'Decisions': 'pending',
+    'Lessons': 'pending',
+    'System Breakdown': 'pending',
+    'How-To Guide': 'pending',
+    'Schematic': 'pending',
+    'Reference': 'pending',
+    'Naming Conventions': 'active',
+    'File Structure': 'active',
+    'Database Patterns': 'active',
+    'API Patterns': 'active',
+    'Component Patterns': 'active',
+    'Quirks & Gotchas': 'pending',
+    'Snippets': 'pending',
+    'Other': 'pending'
+  };
+  return statusMap[bucket] || 'pending';
+}
+
+// Convention type mapping based on bucket
+function getConventionType(bucket) {
+  const typeMap = {
+    'File Structure': 'structure',
+    'API Patterns': 'api',
+    'Database Patterns': 'database',
+    'Component Patterns': 'component',
+    'Naming Conventions': 'naming'
+  };
+  return typeMap[bucket] || 'other';
+}
+
+// Doc type mapping based on bucket
+function getDocType(bucket) {
+  const typeMap = {
+    'System Breakdown': 'breakdown',
+    'How-To Guide': 'howto',
+    'Schematic': 'schematic',
+    'Reference': 'reference'
+  };
+  return typeMap[bucket] || 'reference';
+}
+
+
+/**
+ * Initialize - load all projects (RESTORED from v5)
+ */
+async function initialize() {
+  await loadProjects();
+  logger.info('Processor v6.1 initialized', {
+    totalProjects: allProjects.length,
+    parentProjects: parentProjects.length,
+    pathsLoaded: projectPaths.length,
+    timeWindow: '30 minutes',
+    mode: 'time-window-aggregation'
+  });
+  return true;
+}
+
+/**
+ * Load ALL projects for path matching (RESTORED from v5)
+ */
+async function loadProjects() {
+  try {
+    const { data: projects } = await db.from('dev_projects')
+      .select('id, name, slug, client_id, server_path, local_path, parent_id, is_parent, droplet_name, droplet_ip, port_dev')
+      .eq('is_active', true);
+
+    if (projects) {
+      allProjects = projects.map(p => ({
+        id: p.id,
+        name: p.name,
+        slug: p.slug,
+        client_id: p.client_id,
+        server_path: p.server_path,
+        local_path: p.local_path,
+        parent_id: p.parent_id,
+        is_parent: p.is_parent,
+        droplet_name: p.droplet_name,
+        droplet_ip: p.droplet_ip,
+        port_dev: p.port_dev
+      }));
+
+      parentProjects = allProjects.filter(p => !p.parent_id);
+      projectLookup = {};
+      projectBySlug = {};
+      projectPaths = [];
+
+      for (const p of allProjects) {
+        projectLookup[p.id] = p;
+        if (p.slug) projectBySlug[p.slug.toLowerCase()] = p;
+        if (p.name) projectBySlug[p.name.toLowerCase()] = p;
+
+        // Build path matching list from BOTH server_path AND local_path
+        if (p.server_path) {
+          projectPaths.push({
+            path: p.server_path.toLowerCase().replace(/\\/g, '/'),
+            project: p,
+            type: 'server'
+          });
+        }
+        if (p.local_path) {
+          projectPaths.push({
+            path: p.local_path.toLowerCase().replace(/\\/g, '/'),
+            project: p,
+            type: 'local'
+          });
+        }
+      }
+
+      // Sort by path length descending (most specific first)
+      projectPaths.sort((a, b) => b.path.length - a.path.length);
+
+      logger.info('Loaded projects', {
+        total: allProjects.length,
+        parents: parentProjects.length,
+        paths: projectPaths.length
+      });
+    }
+  } catch (err) {
+    logger.error('Failed to load projects', { error: err.message });
+  }
+}
+
+/**
+ * Check if path is Windows (RESTORED from v5)
+ */
+function isWindowsPath(path) {
+  return /^[a-z]:/i.test(path) || path.includes('\\');
+}
+
+/**
+ * Extract port from folder name like ai-chad-5401 -> 5401 (RESTORED from v5)
+ */
+function extractPortFromFolderName(folderName) {
+  const portMatch = folderName.match(/(\d{4,5})$/);
+  return portMatch ? parseInt(portMatch[1], 10) : null;
+}
+
+/**
+ * Extract project folder from path (RESTORED from v5)
+ */
+function extractProjectFolder(path) {
+  if (!path) return null;
+
+  const isWindows = isWindowsPath(path);
+  const normalized = path.replace(/\\/g, '/');
+  const segments = normalized.split('/').filter(Boolean);
+  const projectParents = ['projects', 'studio', 'ai-team', 'premier_group', 'www', 'var'];
+
+  for (let i = 0; i < segments.length - 1; i++) {
+    const seg = segments[i].toLowerCase();
+    if (projectParents.includes(seg)) {
+      const projectFolder = segments[i + 1];
+      if (projectFolder && !projectFolder.startsWith('.') && projectFolder.length > 2) {
+        let fullPath;
+        if (isWindows) {
+          fullPath = segments.slice(0, i + 2).join('/');
+        } else {
+          fullPath = '/' + segments.slice(0, i + 2).join('/');
+        }
+        return { name: projectFolder, fullPath: fullPath };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Find parent by walking up the path (RESTORED from v5)
+ */
+function findParentByWalkingUp(normalizedPath) {
+  const segments = normalizedPath.split('/').filter(Boolean);
+
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const testPath = '/' + segments.slice(0, i + 1).join('/');
+
+    for (const { path: projectPath, project } of projectPaths) {
+      if (testPath === projectPath || testPath.endsWith(projectPath)) {
+        return { project, matchedPath: testPath };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Auto-create child project (RESTORED from v5)
+ */
+async function autoCreateProject(folderName, fullPath, parentProject) {
+  const slug = folderName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  const name = folderName.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+  if (!parentProject) {
+    logger.warn('Cannot auto-create project without parent', { folderName, fullPath });
+    return null;
+  }
+
+  const portDev = extractPortFromFolderName(folderName);
+  const isLocal = isWindowsPath(fullPath);
+  const normalizedPath = fullPath.replace(/\\/g, '/');
+
+  // Derive server_path from parent if we only have local_path
+  // e.g. parent server: /var/www/Studio, child local: C:/Projects/Studio/new-project
+  // -> child server: /var/www/Studio/new-project
+  let serverPath = isLocal ? null : normalizedPath;
+  let localPath = isLocal ? normalizedPath : null;
+
+  if (isLocal && parentProject.server_path) {
+    // Derive server path: parent_server + folder_name
+    serverPath = parentProject.server_path.replace(/\/$/, '') + '/' + folderName;
+  }
+
+  // server_path is required, skip if we can't derive it
+  if (!serverPath) {
+    logger.warn('Cannot auto-create project without server_path', { folderName, fullPath });
+    return null;
+  }
+
+  try {
+    const { data, error } = await db.from('dev_projects').insert({
+      name: name,
+      slug: slug,
+      server_path: serverPath,
+      local_path: localPath,
+      parent_id: parentProject.id,
+      client_id: parentProject.client_id,
+      droplet_name: parentProject.droplet_name,
+      droplet_ip: parentProject.droplet_ip,
+      table_prefix: slug.replace(/-/g, '_') + '_',
+      port_dev: portDev,
+      is_parent: false,
+      is_active: true,
+      created_at: new Date().toISOString()
+    }).select('id, name, slug, client_id, server_path, local_path, parent_id, is_parent, droplet_name, droplet_ip, port_dev').single();
+
+    if (error) {
+      logger.warn('Failed to auto-create child project', { slug, error: error.message });
+      return null;
+    }
+
+    const project = {
+      id: data.id,
+      name: data.name,
+      slug: data.slug,
+      client_id: data.client_id,
+      server_path: data.server_path,
+      local_path: data.local_path,
+      parent_id: data.parent_id,
+      is_parent: data.is_parent,
+      droplet_name: data.droplet_name,
+      droplet_ip: data.droplet_ip,
+      port_dev: data.port_dev
+    };
+
+    allProjects.push(project);
+    projectLookup[project.id] = project;
+    projectBySlug[project.slug] = project;
+
+    projectPaths.push({
+      path: normalizedPath.toLowerCase(),
+      project: project,
+      type: isLocal ? 'local' : 'server'
+    });
+    projectPaths.sort((a, b) => b.path.length - a.path.length);
+
+    logger.info('Auto-created child project', {
+      name, slug, path: normalizedPath,
+      parentName: parentProject.name
+    });
+
+    return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+  } catch (err) {
+    logger.error('Auto-create project failed', { error: err.message });
+    return null;
+  }
+}
+
+/**
+ * Detect project from path - FULL VERSION (RESTORED from v5)
+ */
+async function detectProjectFromPath(path) {
+  if (!path) return {};
+
+  // If already UUID
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRegex.test(path)) {
+    const project = projectLookup[path];
+    if (project) {
+      return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+    }
+  }
+
+  const normalized = path.toLowerCase().replace(/\\/g, '/');
+
+  // 1. EXACT/CONTAINS MATCH against project paths (most specific first)
+  for (const { path: projectPath, project } of projectPaths) {
+    if (normalized.includes(projectPath)) {
+      if (project.is_parent) continue;
+      return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+    }
+  }
+
+  // 2. SLUG MATCH in path segments
+  const segments = normalized.split('/').filter(Boolean);
+  for (const seg of segments) {
+    if (projectBySlug[seg] && !projectBySlug[seg].is_parent) {
+      const project = projectBySlug[seg];
+      return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+    }
+
+    // Partial match: path has "security" but slug is "31001-security"
+    for (const [slug, project] of Object.entries(projectBySlug)) {
+      if ((slug.endsWith('-' + seg) || slug.endsWith('_' + seg)) && !project.is_parent) {
+        return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+      }
+      const slugWithoutPort = slug.replace(/^\d+-/, '');
+      if (slugWithoutPort === seg && !project.is_parent) {
+        return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+      }
+    }
+  }
+
+  // 3. AUTO-DISCOVERY: Extract folder, find parent, create child
+  const folderInfo = extractProjectFolder(path);
+  if (folderInfo) {
+    const existingSlug = folderInfo.name.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    if (projectBySlug[existingSlug] && !projectBySlug[existingSlug].is_parent) {
+      const project = projectBySlug[existingSlug];
+      return { project_id: project.id, client_id: project.client_id, parent_id: project.parent_id };
+    }
+
+    const parentResult = findParentByWalkingUp(normalized);
+    if (parentResult) {
+      logger.info('Found parent for auto-discovery', {
+        newFolder: folderInfo.name,
+        parentName: parentResult.project.name
+      });
+      return await autoCreateProject(folderInfo.name, folderInfo.fullPath, parentResult.project);
+    } else {
+      logger.warn('No parent project found for path', { path: normalized, folder: folderInfo.name });
+    }
+  }
+
+  return {};
+}
+
+/**
+ * Log AI usage to database
+ */
+async function logUsage(model, inputTokens, outputTokens, durationMs, taskType = 'extraction') {
+  const costPerMillion = {
+    'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+    'claude-3-5-haiku-20241022': { input: 1.00, output: 5.00 }
+  };
+
+  const rates = costPerMillion[model] || costPerMillion['claude-3-haiku-20240307'];
+  const costUsd = (inputTokens * rates.input / 1000000) + (outputTokens * rates.output / 1000000);
+
+  try {
+    await db.from('dev_ai_usage').insert({
+      service: 'anthropic',
+      model,
+      task_type: taskType,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      cost_usd: costUsd,
+      duration_ms: durationMs,
+      success: true
+    });
+
+    logger.info('Usage logged', {
+      model,
+      tokens: inputTokens + outputTokens,
+      cost: `$${costUsd.toFixed(4)}`,
+      duration: `${durationMs}ms`
+    });
+
+    return { costUsd, inputTokens, outputTokens };
+  } catch (err) {
+    logger.error('Failed to log usage', { error: err.message });
+    return { costUsd: 0 };
+  }
+}
+
+/**
+ * Check if we're within daily budget
+ */
+async function checkDailyBudget() {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const { data, error } = await db.from('dev_ai_usage')
+      .select('cost_usd')
+      .gte('created_at', today + 'T00:00:00Z')
+      .lt('created_at', today + 'T23:59:59Z');
+
+    if (error) throw error;
+
+    const totalSpent = (data || []).reduce((sum, r) => sum + parseFloat(r.cost_usd || 0), 0);
+    const remaining = DAILY_BUDGET_USD - totalSpent;
+
+    return {
+      spent: totalSpent,
+      remaining,
+      budget: DAILY_BUDGET_USD,
+      withinBudget: remaining > 0
+    };
+  } catch (err) {
+    logger.error('Failed to check budget', { error: err.message });
+    return { spent: 0, remaining: DAILY_BUDGET_USD, budget: DAILY_BUDGET_USD, withinBudget: true };
+  }
+}
+
+/**
+ * Group sessions into 30-min time windows
+ */
+function groupSessionsByTimeWindow(sessions) {
+  const windows = {};
+
+  for (const session of sessions) {
+    const startedAt = new Date(session.started_at).getTime();
+    const windowStart = Math.floor(startedAt / TIME_WINDOW_MS) * TIME_WINDOW_MS;
+    const windowKey = windowStart.toString();
+
+    if (!windows[windowKey]) {
+      windows[windowKey] = {
+        windowStart,
+        windowEnd: windowStart + TIME_WINDOW_MS,
+        sessions: []
+      };
+    }
+    windows[windowKey].sessions.push(session);
+  }
+
+  return windows;
+}
+
+/**
+ * Main entry point - process by TIME WINDOW
+ */
+async function process(batchSize = 50) {
+  const budget = await checkDailyBudget();
+  logger.info('Budget check', {
+    spent: `$${budget.spent.toFixed(4)}`,
+    remaining: `$${budget.remaining.toFixed(4)}`,
+    budget: `$${budget.budget.toFixed(2)}`
+  });
+
+  if (!budget.withinBudget) {
+    logger.warn('Daily budget exceeded - skipping AI extraction', { spent: budget.spent });
+    return { processed: 0, errors: 0, items: 0, budgetExceeded: true };
+  }
+
+  let windowsProcessed = 0;
+  let sessionsProcessed = 0;
+  let errors = 0;
+  let itemCount = 0;
+
+  try {
+    const { data: sessions, error } = await db.from('dev_ai_sessions')
+      .select('id, started_at, project_id, raw_content, source_type, source_name')
+      .eq('status', 'active')
+      .order('started_at', { ascending: true })
+      .limit(batchSize);
+
+    if (error) throw error;
+    if (!sessions || sessions.length === 0) {
+      return { processed: 0, errors: 0, items: 0 };
+    }
+
+    const windows = groupSessionsByTimeWindow(sessions);
+    const windowCount = Object.keys(windows).length;
+
+    logger.info('Processing time windows', {
+      totalSessions: sessions.length,
+      windows: windowCount
+    });
+
+    for (const [windowKey, window] of Object.entries(windows)) {
+      const currentBudget = await checkDailyBudget();
+      if (!currentBudget.withinBudget) {
+        logger.warn('Budget limit reached mid-process');
+        break;
+      }
+
+      try {
+        const result = await processTimeWindow(window);
+        if (result.success) {
+          windowsProcessed++;
+          sessionsProcessed += window.sessions.length;
+          itemCount += result.items;
+        }
+      } catch (err) {
+        logger.error('Window failed', {
+          windowKey,
+          sessions: window.sessions.length,
+          error: err.message
+        });
+        errors++;
+      }
+    }
+  } catch (err) {
+    logger.error('Process failed', { error: err.message });
+    errors++;
+  }
+
+  logger.info('Process complete', {
+    windows: windowsProcessed,
+    sessions: sessionsProcessed,
+    errors,
+    items: itemCount
+  });
+
+  return { processed: sessionsProcessed, windows: windowsProcessed, errors, items: itemCount };
+}
+
+/**
+ * Process a single time window (multiple sessions)
+ */
+async function processTimeWindow(window) {
+  const { windowStart, windowEnd, sessions } = window;
+  const sessionIds = sessions.map(s => s.id);
+
+  let combinedContent = '';
+  const sources = new Set();
+  let primaryProjectPath = null;
+
+  for (const session of sessions) {
+    const content = session.raw_content || '';
+    if (content.length < 50) continue;
+
+    sources.add(session.source_name || session.source_type || 'unknown');
+
+    // Extract real cwd from content
+    const realCwd = extractCwdFromContent(content);
+    if (realCwd && !primaryProjectPath) {
+      primaryProjectPath = realCwd;
+    }
+    if (!primaryProjectPath && session.project_id) {
+      primaryProjectPath = session.project_id;
+    }
+
+    const sourceName = session.source_name || session.source_type || 'session';
+    combinedContent += `\n\n=== SOURCE: ${sourceName} ===\n`;
+    combinedContent += content;
+  }
+
+  if (combinedContent.length < (config.MIN_CONTENT_LENGTH || 100)) {
+    for (const id of sessionIds) {
+      await markSessionProcessed(id, 0);
+    }
+    return { success: false, items: 0, reason: 'content too short' };
+  }
+
+  if (combinedContent.length > MAX_COMBINED_CONTENT) {
+    combinedContent = combinedContent.slice(-MAX_COMBINED_CONTENT);
+  }
+
+  const windowTime = new Date(windowStart).toISOString();
+  logger.info('Processing window', {
+    window: windowTime,
+    sessions: sessions.length,
+    sources: [...sources],
+    contentLen: combinedContent.length,
+    projectPath: primaryProjectPath
+  });
+
+  const allItems = [];
+
+  // 1. Structure extraction (free - regex)
+  const structureItems = await extractStructure(combinedContent, primaryProjectPath);
+  allItems.push(...structureItems);
+
+  if (structureItems.length > 0) {
+    logger.info('Structure items', { count: structureItems.length });
+  }
+
+  // 2. ONE AI call for entire window
+  const smartItems = await extractWithClaude(combinedContent, primaryProjectPath);
+  allItems.push(...smartItems);
+
+  if (smartItems.length > 0) {
+    logger.info('Smart items', { count: smartItems.length });
+  }
+
+  if (allItems.length === 0) {
+    for (const id of sessionIds) {
+      await markSessionProcessed(id, 0);
+    }
+    return { success: true, items: 0 };
+  }
+
+  const uniqueItems = deduplicateItems(allItems);
+
+  let itemsWritten = 0;
+  for (const item of uniqueItems) {
+    const success = await writeItem(item, sessionIds[0]);
+    if (success) itemsWritten++;
+  }
+
+  for (const id of sessionIds) {
+    await markSessionProcessed(id, Math.ceil(itemsWritten / sessions.length));
+  }
+
+  logger.info('Window complete', {
+    window: windowTime,
+    sessions: sessions.length,
+    items: itemsWritten,
+    buckets: [...new Set(uniqueItems.map(i => i.bucket))]
+  });
+
+  return { success: true, items: itemsWritten };
+}
+
+/**
+ * Extract cwd from JSONL content
+ */
+function extractCwdFromContent(content) {
+  const cwdMatch = content.match(/"cwd"\s*:\s*"([^"]+)"/);
+  if (cwdMatch) {
+    return cwdMatch[1].replace(/\\\\/g, '/').replace(/\\/g, '/');
+  }
+  return null;
+}
+
+/**
+ * Build a directory tree string from a list of file paths
+ */
+function buildDirectoryTree(paths, projectRoot) {
+  // Normalize and sort paths
+  const normalized = paths.map(p => p.replace(/\\/g, '/'));
+
+  // Build tree structure
+  const tree = {};
+  for (const fullPath of normalized) {
+    // Get path relative to project root
+    let relativePath = fullPath;
+    if (projectRoot) {
+      const rootNorm = projectRoot.replace(/\\/g, '/').toLowerCase();
+      const pathLower = fullPath.toLowerCase();
+      if (pathLower.includes(rootNorm)) {
+        const idx = pathLower.indexOf(rootNorm);
+        relativePath = fullPath.substring(idx + rootNorm.length);
+        if (relativePath.startsWith('/')) relativePath = relativePath.substring(1);
+      }
+    }
+
+    const parts = relativePath.split('/').filter(Boolean);
+    let current = tree;
+    for (const part of parts) {
+      if (!current[part]) current[part] = {};
+      current = current[part];
+    }
+  }
+
+  // Render tree to string
+  function renderTree(node, prefix = '', isLast = true) {
+    const entries = Object.keys(node).sort((a, b) => {
+      // Directories first (have children), then files
+      const aIsDir = Object.keys(node[a]).length > 0;
+      const bIsDir = Object.keys(node[b]).length > 0;
+      if (aIsDir !== bIsDir) return bIsDir ? 1 : -1;
+      return a.localeCompare(b);
+    });
+
+    let result = '';
+    entries.forEach((name, idx) => {
+      const isLastEntry = idx === entries.length - 1;
+      const connector = isLastEntry ? '└── ' : '├── ';
+      const extension = isLastEntry ? '    ' : '│   ';
+
+      result += prefix + connector + name + '\n';
+
+      const children = node[name];
+      if (Object.keys(children).length > 0) {
+        result += renderTree(children, prefix + extension, isLastEntry);
+      }
+    });
+    return result;
+  }
+
+  return renderTree(tree);
+}
+
+/**
+ * Extract structure items (free - regex) - FULL VERSION from v5
+ */
+async function extractStructure(content, sessionPath) {
+  const items = [];
+  const projectInfo = await detectProjectFromPath(sessionPath);
+
+  // SQL Schema detection
+  const sqlMatches = content.match(/CREATE TABLE[\s\S]{10,500}?;/gi) || [];
+  const alterMatches = content.match(/ALTER TABLE[\s\S]{10,300}?;/gi) || [];
+
+  for (const sql of [...sqlMatches, ...alterMatches].slice(0, 5)) {
+    const tableMatch = sql.match(/(?:CREATE|ALTER) TABLE (?:IF NOT EXISTS )?["']?(\w+)["']?/i);
+    if (tableMatch) {
+      items.push({
+        bucket: 'Database Patterns',
+        title: `Schema: ${tableMatch[1]}`,
+        content: sql.trim(),
+        keywords: ['sql', 'schema', tableMatch[1].toLowerCase()],
+        isStructure: true,
+        ...projectInfo
+      });
+    }
+  }
+
+  // API endpoint detection
+  const apiPatterns = [
+    /(?:GET|POST|PUT|PATCH|DELETE)\s+[\/][\w\-\/\{\}:]+/gi,
+    /router\.(get|post|put|patch|delete)\s*\(['"][\w\-\/\{\}:]+['"]/gi,
+    /app\.(get|post|put|patch|delete)\s*\(['"][\w\-\/\{\}:]+['"]/gi
+  ];
+
+  for (const pattern of apiPatterns) {
+    const matches = content.match(pattern) || [];
+    for (const match of matches.slice(0, 10)) {
+      const endpoint = match.replace(/router\.|app\.|['"\(\)]/g, '');
+      if (endpoint.length > 3) {
+        items.push({
+          bucket: 'API Patterns',
+          title: `Endpoint: ${endpoint.slice(0, 50)}`,
+          content: match,
+          keywords: ['api', 'endpoint', 'route'],
+          isStructure: true,
+          ...projectInfo
+        });
+      }
+    }
+  }
+
+  // FILE PATH DETECTION - Windows and Unix paths
+  // Note: JSONL content has double-escaped backslashes (C:\\\\Users\\\\)
+  const filePathPatterns = [
+    /[A-Z]:\\\\(?:[^\\/:*?"<>|\r\n]+\\\\)*[^\\/:*?"<>|\r\n]+\.\w{1,10}/gi,  // Windows JSONL escaped
+    /[A-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]+\.\w{1,10}/gi,      // Windows normal
+    /\/(?:var|home|usr|www)\/[\w.-]+(?:\/[\w.-]+)+\.\w{1,10}/gi,            // Unix
+    /src\/[^\s'"`,;)}\]]+\.\w{2,6}/gi,                                       // Relative src paths
+  ];
+
+  const validExts = ['js', 'ts', 'tsx', 'jsx', 'py', 'json', 'md', 'sql', 'sh', 'css', 'html', 'vue', 'go', 'rs', 'java', 'php', 'rb', 'yml', 'yaml', 'env', 'config'];
+  const skipExts = ['log', 'tmp', 'cache', 'lock', 'map', 'svg', 'png', 'jpg', 'gif', 'ico', 'woff', 'ttf'];
+  const skipPaths = ["/usr/lib/", "/usr/share/", "/var/run/", "/var/log/", "/root/.pm2/", "node_modules/", ".s.PGSQL"];
+  const treeChars = /[└├│─┌┐┘┤┬┴┼]/;
+
+  // Collect paths by project
+  const pathsByProject = {};
+  const seenPaths = new Set();
+
+  for (const pattern of filePathPatterns) {
+    const matches = content.match(pattern) || [];
+    for (let rawPath of matches) {
+      // Unescape JSONL double-backslashes and normalize
+      const filePath = rawPath.replace(/\\\\/g, '/').replace(/\\/g, '/');
+      const normalized = filePath.toLowerCase();
+      if (seenPaths.has(normalized)) continue;
+      seenPaths.add(normalized);
+
+      const fileName = filePath.split('/').pop();
+      const ext = fileName?.split('.').pop()?.toLowerCase();
+
+      // Skip non-code files
+      if (skipExts.includes(ext)) continue;
+      if (!fileName || fileName.length < 3) continue;
+      if (!validExts.includes(ext)) continue;
+      // Skip system paths and tree output
+      if (skipPaths.some(sp => normalized.includes(sp.toLowerCase()))) continue;
+      if (treeChars.test(rawPath)) continue;
+
+      // Detect project for this path
+      const pathProject = await detectProjectFromPath(filePath);
+      const projectId = pathProject?.project_id || 'unknown';
+
+      if (!pathsByProject[projectId]) {
+        pathsByProject[projectId] = {
+          paths: [],
+          projectInfo: pathProject || projectInfo
+        };
+      }
+      pathsByProject[projectId].paths.push(filePath);
+    }
+  }
+
+  // Create INDIVIDUAL file entries for StructureTab (not tree dumps)
+  for (const [projectId, data] of Object.entries(pathsByProject)) {
+    for (const filePath of data.paths) {
+      const normalized = filePath.replace(/\\/g, '/');
+      const fileName = normalized.split('/').pop();
+      const ext = fileName?.split('.').pop()?.toLowerCase() || '';
+      
+      items.push({
+        bucket: 'File Structure',
+        convention_type: 'structure',
+        title: fileName,
+        content: filePath,
+        keywords: ['structure', ext, fileName?.replace(/.[^.]+$/, '') || ''],
+        isStructure: true,
+        project_id: data.projectInfo?.project_id || null,
+        client_id: data.projectInfo?.client_id || null,
+        parent_id: data.projectInfo?.parent_id || null
+      });
+    }
+  }
+
+  return items;
+}
+
+/**
+ * Claude AI extraction - ONE call per time window
+ */
+async function extractWithClaude(content, sessionPath) {
+  const client = getClient();
+  const projectInfo = await detectProjectFromPath(sessionPath);
+
+  const systemPrompt = `You extract development items from coding sessions. 
+
+CRITICAL: ONLY extract what is EXPLICITLY discussed in the content. Do NOT hallucinate or make up items.
+
+BUCKETS:
+- Bugs Open: Real unresolved errors. Include actual error messages, file paths mentioned.
+- Bugs Fixed: Bugs that were solved. What broke and the fix applied.
+- Todos: Real tasks mentioned. Include context about why and where.
+- Work Log: What was actually worked on - files changed, features built.
+- Ideas: Actual feature ideas proposed with full explanation.
+- Decisions: Real technical choices made with reasoning.
+- Lessons: Actual insights or gotchas discovered.
+
+Return JSON array:
+[{"bucket": "Work Log", "title": "Clear descriptive title", "content": "Full details from session - 2-5 sentences with real specifics", "keywords": ["real", "tags"]}]
+
+Quality over quantity. No hallucination. Empty sessions return: []`;
+
+  const startTime = Date.now();
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-3-haiku-20240307',
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages: [{
+        role: 'user',
+        content: `Extract development items from this 30-minute coding session:\n\n${content.slice(0, 50000)}`
+      }]
+    });
+
+    const durationMs = Date.now() - startTime;
+
+    if (response.usage) {
+      await logUsage(
+        'claude-3-haiku-20240307',
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+        durationMs
+      );
+    }
+
+    const text = response.content[0]?.text || '';
+
+    let items = [];
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      try {
+        items = JSON.parse(jsonMatch[0]);
+      } catch (e) {
+        logger.warn('JSON parse failed', { error: e.message });
+      }
+    }
+
+    // Add project info to items
+    return items.map(item => ({
+      ...item,
+      ...projectInfo,
+      isStructure: false
+    }));
+
+  } catch (err) {
+    logger.error('Claude extraction failed', { error: err.message });
+    await logUsage('claude-3-haiku-20240307', 0, 0, Date.now() - startTime);
+    return [];
+  }
+}
+
+/**
+ * Deduplicate items
+ */
+function deduplicateItems(items) {
+  const seen = new Map();
+
+  return items.filter(item => {
+    const key = item.bucket + ':' + (item.title || '').toLowerCase().slice(0, 50);
+
+    if (seen.has(key)) {
+      const existing = seen.get(key);
+      if ((item.content || '').length > (existing.content || '').length) {
+        seen.set(key, item);
+      }
+      return false;
+    }
+
+    seen.set(key, item);
+    return true;
+  });
+}
+
+// This replaces the writeItem function in processor-v6.js
+
+/**
+ * Buckets that are auto-validated (low-judgment passthrough)
+ */
+const AUTO_VALIDATE_BUCKETS = [
+  'Naming Conventions',
+  'File Structure', 
+  'Database Patterns',
+  'API Patterns',
+  'Component Patterns'
+];
+
+/**
+ * Write item to destination table
+ * v6.2: Adds candidate gating via metadata + validated_at
+ */
+async function writeItem(item, sessionId) {
+  const table = BUCKET_TO_TABLE[item.bucket] || 'dev_ai_knowledge';
+  
+  // Determine if this bucket should be auto-validated
+  const isAutoValidate = AUTO_VALIDATE_BUCKETS.includes(item.bucket);
+  
+  // Build metadata with origin + review flag
+  const metadata = {
+    origin_worker: '02-Jen',
+    requires_review: !isAutoValidate,
+    extracted_at: new Date().toISOString()
+  };
+  
+  // For Bugs Fixed bucket, add completion signal instead of setting status
+  if (item.bucket === 'Bugs Fixed') {
+    metadata.completion_signal = 'fixed_mentioned';
+  }
+
+  const baseRecord = {
+    client_id: item.client_id || null,
+    parent_id: item.parent_id || null,
+    project_id: item.project_id || null,
+    bucket: item.bucket,
+    keywords: JSON.stringify(item.keywords || []),
+    source_session_id: sessionId,
+    status: getStatusForBucket(item.bucket),
+    created_at: new Date().toISOString(),
+    metadata: metadata,
+    validated_at: isAutoValidate ? new Date().toISOString() : null
+  };
+
+  try {
+    if (table === 'dev_ai_todos') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    } else if (table === 'dev_ai_bugs') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title,
+        severity: 'medium'
+      });
+    } else if (table === 'dev_ai_knowledge') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        category: item.bucket
+      });
+    } else if (table === 'dev_ai_docs') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        doc_type: getDocType(item.bucket)
+      });
+    } else if (table === 'dev_ai_conventions') {
+      await db.from(table).insert({
+        ...baseRecord,
+        name: (item.title || '').substring(0, 200),
+        description: item.content || item.title,
+        convention_type: getConventionType(item.bucket)
+      });
+    } else if (table === 'dev_ai_decisions') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        description: item.content || item.title
+      });
+    } else if (table === 'dev_ai_lessons') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        the_problem: item.content || item.title,
+        description: item.content || item.title,
+        what_was_tried: item.what_was_tried || item.content || item.title
+      });
+    } else if (table === 'dev_ai_journal') {
+      await db.from(table).insert({
+        ...baseRecord,
+        title: (item.title || '').substring(0, 200),
+        content: item.content || item.title,
+        entry_type: item.bucket === 'Work Log' ? 'work_log' : 'journal'
+      });
+    } else if (table === 'dev_ai_snippets') {
+      await db.from(table).insert({
+        ...baseRecord,
+        content: item.content || item.title,
+        snippet_type: 'extracted'
+      });
+    }
+
+    return true;
+  } catch (err) {
+    logger.error('Failed to write item', { table, bucket: item.bucket, error: err.message });
+    return false;
+  }
+}
+
+      });
+    }
+
+    return true;
+  } catch (err) {
+    logger.error('Failed to write item', { table, bucket: item.bucket, error: err.message });
+    return false;
+  }
+}
+
+/**
+ * Mark session as processed
+ */
+async function markSessionProcessed(sessionId, itemCount) {
+  try {
+    await db.from('dev_ai_sessions')
+      .update({
+        status: 'processed',
+        processed_at: new Date().toISOString(),
+        items_extracted: itemCount
+      })
+      .eq('id', sessionId);
+  } catch (err) {
+    logger.error('Failed to mark processed', { error: err.message });
+  }
+}
+
+// Exports
+const quickProcess = () => process(10);
+const smartProcess = () => process(50);
+
+module.exports = {
+  initialize,
+  process,
+  quickProcess,
+  smartProcess,
+  checkDailyBudget
+};
