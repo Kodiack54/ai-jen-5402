@@ -1,0 +1,12 @@
+{
+  "name": "ai-jen-5402",
+  "version": "2.0.0",
+  "description": "Jen v2 - Single purpose session processor",
+  "scripts": {
+    "heartbeat": "node app/jen-heartbeat.js",
+    "processor": "node app/jen_session_processor.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.0"
+  }
+}
